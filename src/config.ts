@@ -15,6 +15,7 @@ export const config = {
     // VRAM eviction thrash between two resident models.
     model: process.env.OLLAMA_MODEL || "qwen3.6:35b-a3b",
     fastModel: process.env.OLLAMA_FAST_MODEL || process.env.OLLAMA_MODEL || "qwen3.6:35b-a3b",
+    contextLength: parseInt(process.env.OLLAMA_CONTEXT_LENGTH || "32768"),
   },
   twitch: {
     channel: process.env.TWITCH_CHANNEL || "",

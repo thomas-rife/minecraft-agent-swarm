@@ -196,7 +196,7 @@ RULES:
 ${actionLine}
 
 Respond with JSON ONLY:
-{"success":true,"thought":"Brief assessment","nextAction":"action_name","nextParams":{},"goalComplete":false}
+{"success":true,"thought":"Brief assessment","nextAction":"action_name","nextlityarams":{},"goalComplete":false}
 
 If no clear next step, set nextAction to null and goalComplete to true.
 `;

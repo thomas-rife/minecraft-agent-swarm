@@ -11,6 +11,7 @@ import {
   type RoleContext,
 } from "./prompts.js";
 import { createLogger } from "../util/logger.js";
+import { recordLlmResponse } from "../bot/scoreboard.js";
 
 /** Model-aware think option. qwen3.6 needs think:false (it otherwise burns the
  *  whole token budget reasoning — the original gotcha). gpt-oss models are
@@ -19,6 +20,15 @@ import { createLogger } from "../util/logger.js";
  *  a reasoning-effort level; "low" keeps decision latency down. */
 function thinkFor(model: string): boolean | "low" | "medium" | "high" {
   return model.includes("gpt-oss") ? "low" : false;
+}
+
+/** LFM2.5 is tuned for low-temperature agent/tool use. Other models retain
+ * the task-specific temperatures established below. */
+function samplingFor(model: string, temperature: number) {
+  if (model.includes("lfm2.5")) {
+    return { temperature: 0.2, top_k: 80, repeat_penalty: 1.05 };
+  }
+  return { temperature, repeat_penalty: 1.15 };
 }
 
 const ollama = new Ollama({ host: config.ollama.host });
@@ -236,17 +246,21 @@ export async function queryStrategic(
   ];
 
   try {
+    const startedAt = Date.now();
     const response = await ollama.chat({
       model: config.ollama.model, // Strong model for strategic decisions
       messages,
       think: thinkFor(config.ollama.model),
       format: "json", // syntactically valid JSON guaranteed (schema mode is ignored by qwen3.6 on ollama 0.20)
       options: {
-        temperature: 0.8,
-        repeat_penalty: 1.15, // the 8B fine-tune can loop ("Forge demands...!" x50) without this
-        num_predict: 1024,
+        ...samplingFor(config.ollama.model, 0.8),
+        num_ctx: config.ollama.contextLength,
+        // Strategic decisions are compact JSON. Keep enough room for gpt-oss
+        // reasoning while preventing one request from monopolizing the queue.
+        num_predict: 512,
       },
     });
+    recordLlmResponse("strategic", config.ollama.model, response, Date.now() - startedAt);
 
     llmLog.info(
       "LLM:strategic",
@@ -277,17 +291,19 @@ export async function queryReactive(
   ];
 
   try {
+    const startedAt = Date.now();
     const response = await ollama.chat({
       model: config.ollama.fastModel,
       messages,
       think: thinkFor(config.ollama.fastModel),
       format: "json", // syntactically valid JSON guaranteed (schema mode is ignored by qwen3.6 on ollama 0.20)
       options: {
-        temperature: 0.5, // Lower temp for urgent decisions — be reliable, not creative
-        repeat_penalty: 1.15, // the 8B fine-tune can loop ("Forge demands...!" x50) without this
+        ...samplingFor(config.ollama.fastModel, 0.5),
+        num_ctx: config.ollama.contextLength,
         num_predict: 384,
       },
     });
+    recordLlmResponse("reactive", config.ollama.fastModel, response, Date.now() - startedAt);
 
     llmLog.info(
       "LLM:reactive",
@@ -329,8 +345,8 @@ export async function queryCritic(
       think: thinkFor(config.ollama.fastModel),
       format: "json", // syntactically valid JSON guaranteed (schema mode is ignored by qwen3.6 on ollama 0.20)
       options: {
-        temperature: 0.4, // Low temp — critic should be analytical
-        repeat_penalty: 1.15, // the 8B fine-tune can loop ("Forge demands...!" x50) without this
+        ...samplingFor(config.ollama.fastModel, 0.4),
+        num_ctx: config.ollama.contextLength,
         num_predict: 384,
       },
     });
@@ -484,17 +500,19 @@ export async function queryLLM(
   ];
 
   try {
+    const startedAt = Date.now();
     let response = await ollama.chat({
       model: config.ollama.fastModel,
       messages,
       think: thinkFor(config.ollama.fastModel),
       format: "json", // syntactically valid JSON guaranteed (schema mode is ignored by qwen3.6 on ollama 0.20)
       options: {
-        temperature: 0.85,
-        repeat_penalty: 1.15, // the 8B fine-tune can loop ("Forge demands...!" x50) without this
+        ...samplingFor(config.ollama.fastModel, 0.85),
+        num_ctx: config.ollama.contextLength,
         num_predict: 1024,
       },
     });
+    recordLlmResponse("legacy", config.ollama.fastModel, response, Date.now() - startedAt);
 
     // Retry once on short/empty response
     if (response.message.content.trim().length < 20) {
@@ -512,7 +530,11 @@ export async function queryLLM(
             content: `Quick decision needed. Available actions: explore, gather_wood, craft_gear, mine_block, go_to, idle, chat.\nContext: ${context.slice(0, 500)}\nRespond with JSON only.`,
           },
         ],
-        options: { temperature: 0.6, num_predict: 512 },
+        options: {
+          ...samplingFor(config.ollama.fastModel, 0.6),
+          num_ctx: config.ollama.contextLength,
+          num_predict: 512,
+        },
       });
     }
 
@@ -544,7 +566,8 @@ export async function chatWithLLM(prompt: string, context: string, roleConfig?: 
         { role: "user", content: prompt },
       ],
       options: {
-        temperature: 0.9,
+        ...samplingFor(config.ollama.fastModel, 0.9),
+        num_ctx: config.ollama.contextLength,
         num_predict: 150,
       },
     });

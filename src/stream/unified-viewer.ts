@@ -23,7 +23,7 @@ import { getBotStatus } from "../bot/bulletin.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-const UNIFIED_PORT = 3000;
+const UNIFIED_PORT = 3020;
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {

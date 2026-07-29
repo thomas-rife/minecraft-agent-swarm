@@ -12,6 +12,7 @@
 import fs from "fs";
 import path from "path";
 import type { Bot } from "mineflayer";
+import { config } from "../config.js";
 
 interface BotStats {
   actions: number;
@@ -34,19 +35,37 @@ interface Milestone {
 interface SessionStats {
   sessionId: string;
   sessionStart: string;
+  model: string;
+  fastModel: string;
   /** Updated on each save */
   durationSec: number;
   perBot: Record<string, BotStats>;
   milestones: Milestone[];
+  llm: Record<string, LlmStats>;
+}
+
+interface LlmStats {
+  calls: number;
+  promptTokens: number;
+  outputTokens: number;
+  wallDurationMs: number;
+  evalDurationMs: number;
+  /** Output-token generation speed reported by Ollama, excluding prompt evaluation. */
+  generationTokensPerSec: number;
+  /** End-to-end latency per completed request, including prompt evaluation and queueing. */
+  averageWallMs: number;
 }
 
 const SESSION_START = Date.now();
 const stats: SessionStats = {
   sessionId: new Date(SESSION_START).toISOString().replace(/[:.]/g, "-"),
   sessionStart: new Date(SESSION_START).toISOString(),
+  model: config.ollama.model,
+  fastModel: config.ollama.fastModel,
   durationSec: 0,
   perBot: {},
   milestones: [],
+  llm: {},
 };
 
 const reachedMilestones = new Set<string>();
@@ -123,6 +142,39 @@ export function recordSkillResult(botName: string, success: boolean): void {
 
 export function recordDeath(botName: string): void {
   botStats(botName).deaths++;
+  dirty = true;
+}
+
+/** Record Ollama's native timing counters for model-speed comparisons. */
+export function recordLlmResponse(
+  kind: "strategic" | "reactive" | "legacy",
+  model: string,
+  response: {
+    prompt_eval_count?: number;
+    eval_count?: number;
+    eval_duration?: number;
+  },
+  wallDurationMs: number,
+): void {
+  const key = `${kind}:${model}`;
+  const llm = (stats.llm[key] ??= {
+    calls: 0,
+    promptTokens: 0,
+    outputTokens: 0,
+    wallDurationMs: 0,
+    evalDurationMs: 0,
+    generationTokensPerSec: 0,
+    averageWallMs: 0,
+  });
+  llm.calls++;
+  llm.promptTokens += response.prompt_eval_count ?? 0;
+  llm.outputTokens += response.eval_count ?? 0;
+  llm.wallDurationMs += wallDurationMs;
+  // Ollama durations are nanoseconds.
+  llm.evalDurationMs += (response.eval_duration ?? 0) / 1_000_000;
+  llm.generationTokensPerSec =
+    llm.evalDurationMs > 0 ? llm.outputTokens / (llm.evalDurationMs / 1000) : 0;
+  llm.averageWallMs = llm.wallDurationMs / llm.calls;
   dirty = true;
 }
 

@@ -13,7 +13,7 @@
   header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: #16213e; border-bottom: 1px solid #0f3460; }
   header h1 { font-size: 18px; letter-spacing: 2px; color: #e94560; }
   .header-controls { display: flex; align-items: center; gap: 12px; font-size: 13px; }
-  .btn { padding: 4px 12px; border: 1px solid #555; border-radius: 4px; background: #16213e; color: #ccc; cursor: pointer; font-size: 12px; }
+  .btn { padding: 4px 12px; border: 1px solid #555; border-radius: 4px; background: #16213e; color: #ccc; cursor: pointer; font-size: 12px; text-decoration: none; }
   .btn:hover { background: #0f3460; }
   .btn.active { background: #e94560; border-color: #e94560; color: #fff; }
 
@@ -31,6 +31,11 @@
   .card-pos { font-size: 10px; color: #666; margin-bottom: 4px; }
   .card-view { font-size: 11px; color: #4fc3f7; text-align: center; padding: 2px 0; border: 1px solid #4fc3f7; border-radius: 3px; }
   .card-view:hover { background: rgba(79,195,247,0.15); }
+
+  /* Model performance strip */
+  .perf { display: flex; align-items: center; gap: 18px; padding: 5px 16px; background: #111a31; border-bottom: 1px solid #0f3460; font-size: 11px; color: #999; }
+  .perf strong { color: #ddd; font-weight: 600; }
+  .perf-model { color: #4fc3f7 !important; }
 
   /* Main area */
   .main { display: flex; flex: 1; min-height: 0; }
@@ -53,12 +58,22 @@
 <header>
   <h1>MISSION CONTROL</h1>
   <div class="header-controls">
+    <a class="btn" id="viewerLink" href="#" target="_blank" rel="noopener">OPEN 3D VIEWER</a>
     <button class="btn" id="cycleBtn" onclick="toggleCycle()">MANUAL</button>
     <span id="dayLabel">Day --</span>
   </div>
 </header>
 
 <div class="cards" id="cardRow"></div>
+
+<div class="perf">
+  <span>MODEL <strong class="perf-model" id="perf-model">--</strong></span>
+  <span>GEN <strong id="perf-tps">-- tok/s</strong></span>
+  <span>LATENCY <strong id="perf-latency">--</strong></span>
+  <span>CALLS <strong id="perf-calls">0</strong></span>
+  <span>ACTION SUCCESS <strong id="perf-success">--</strong></span>
+  <span>UPTIME <strong id="perf-uptime">--</strong></span>
+</div>
 
 <div class="main">
   <div class="viewer">
@@ -86,6 +101,10 @@ var states = {};
 var selectedIdx = 0;
 var cycling = false;
 var cycleTimer = null;
+var VIEWER_PORT = 3020;
+
+document.getElementById('viewerLink').href =
+  location.protocol + '//' + location.hostname + ':' + VIEWER_PORT + '/';
 
 function esc(str) {
   var d = document.createElement('div');
@@ -109,6 +128,32 @@ async function init() {
       } catch (e) { /* dashboard may outlive bot process */ }
     }
     pollStash(); setInterval(pollStash, 5000);
+
+    async function pollSession() {
+      try {
+        var r = await fetch('/api/session');
+        var st = await r.json();
+        var llmRows = Object.keys(st.llm || {}).map(function(k) { return st.llm[k]; });
+        var calls = llmRows.reduce(function(n, x) { return n + x.calls; }, 0);
+        var outTokens = llmRows.reduce(function(n, x) { return n + x.outputTokens; }, 0);
+        var evalMs = llmRows.reduce(function(n, x) { return n + x.evalDurationMs; }, 0);
+        var wallMs = llmRows.reduce(function(n, x) { return n + x.wallDurationMs; }, 0);
+        var botRows = Object.keys(st.perBot || {}).map(function(k) { return st.perBot[k]; });
+        var actions = botRows.reduce(function(n, x) { return n + x.actions; }, 0);
+        var successes = botRows.reduce(function(n, x) { return n + x.successes; }, 0);
+        document.getElementById('perf-model').textContent = st.model || '--';
+        document.getElementById('perf-tps').textContent =
+          evalMs > 0 ? (outTokens / (evalMs / 1000)).toFixed(1) + ' tok/s' : '-- tok/s';
+        document.getElementById('perf-latency').textContent =
+          calls > 0 ? (wallMs / calls / 1000).toFixed(2) + 's avg' : '--';
+        document.getElementById('perf-calls').textContent = calls;
+        document.getElementById('perf-success').textContent =
+          actions > 0 ? (successes / actions * 100).toFixed(1) + '% (' + successes + '/' + actions + ')' : '--';
+        document.getElementById('perf-uptime').textContent =
+          Math.floor((st.durationSec || 0) / 3600) + 'h ' + Math.floor(((st.durationSec || 0) % 3600) / 60) + 'm';
+      } catch (e) { /* dashboard may outlive bot process */ }
+    }
+    pollSession(); setInterval(pollSession, 5000);
 
     var res = await fetch('/api/roster');
     bots = await res.json();
@@ -259,10 +304,10 @@ function selectBot(idx) {
   var frame = document.getElementById('viewerFrame');
   var botName = bots[idx].name;
 
-  // Unified viewer: all bots share a single viewer server on port 3000.
+  // Unified viewer: all bots share a single viewer server.
   // Load the iframe once, then use postMessage to switch bots without reloading
   // the page (no re-download of JS/textures).
-  var viewerUrl = 'http://' + location.hostname + ':3000';
+  var viewerUrl = location.protocol + '//' + location.hostname + ':' + VIEWER_PORT;
 
   if (!viewerLoaded) {
     // First time: load the viewer iframe with the selected bot as a hash hint

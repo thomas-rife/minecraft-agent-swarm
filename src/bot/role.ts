@@ -49,17 +49,13 @@ export interface BotRoleConfig {
  * agrees where "The Stash" is. setup_stash ground-snaps the Y at runtime,
  * so this Y only needs to be close enough for pathfinding.
  */
-export const STASH_POS = { x: 286, y: 70, z: -314 };
+export const STASH_POS = { x: -81, y: 80, z: -1172 };
 
-/**
- * The farm site — on the river nearest the village (located via
- * `locate biome minecraft:river`; the earlier "lake" coords were wrong).
- * build_farm travels here first; rivers sit at sea level, hence y=63.
- */
-export const FARM_SITE = { x: 290, y: 71, z: -312 };
+/** Farm site beside the shared forest base. */
+export const FARM_SITE = { x: -75, y: 80, z: -1172 };
 
-/** Renewable tree farm east of the village (saplings + torches, RCON-provisioned). */
-export const TREE_FARM = { x: 306, y: 71, z: -316 };
+/** Renewable tree farm east of the shared forest base. */
+export const TREE_FARM = { x: -60, y: 80, z: -1172 };
 
 /** Atlas: Explorer and miner. Roams widely, finds ores, scouts terrain. */
 export const ATLAS_CONFIG: BotRoleConfig = {
@@ -74,7 +70,7 @@ export const ATLAS_CONFIG: BotRoleConfig = {
   stashPos: STASH_POS,
   // Moved east to fresh forested territory — the X=30 area was fully stripped by previous sessions.
   // Ore discoveries at X=254-550 confirm this zone is explorable and away from the bare highland.
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: -81, y: 0, z: -1172 },
   allowedActions: ["explore", "go_to", "gather_wood", "mine_block", "chat", "eat", "sleep", "flee", "attack"],
   allowedSkills: [],
   keepItems: [
@@ -104,7 +100,7 @@ export const FLORA_CONFIG: BotRoleConfig = {
   leashRadius: 150,
   stashPos: STASH_POS,
   // Matches Atlas safeSpawn — moved east to fresh territory away from the stripped X=30 zone
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: -81, y: 0, z: -1172 },
   allowedActions: ["craft", "eat", "sleep", "go_to", "place_block", "chat", "flee"],
   allowedSkills: ["build_farm", "craft_gear", "smelt_ores", "light_area"],
   keepItems: [
@@ -115,9 +111,9 @@ export const FLORA_CONFIG: BotRoleConfig = {
   priorities: `FLORA PRIORITIES — THE FARM IS YOUR LIFE'S WORK:
 1. If health < 6 and hostile mob nearby: flee
 2. If hungry (food < 14): eat
-3. NO FARM YET? This is your #1 job and it MUST be near water. The village
-   has no water — there is an irrigation bed with water at the village (290, 71, -312). go_to it,
-   THEN invoke_skill build_farm. It crafts the hoe and finds seeds itself.
+3. NO FARM YET? This is your #1 job. Invoke build_farm directly; the farm site
+   is beside the current base near (${FARM_SITE.x}, ${FARM_SITE.y}, ${FARM_SITE.z}),
+   and the skill handles travel, the hoe, water, and seeds itself.
 4. If the farm exists and wheat is mature: build_farm again (harvests + replants).
 5. If inventory has raw ore: smelt_ores
 6. When inventory is 30+ full: deposit_stash
@@ -129,13 +125,13 @@ export const FORGE_CONFIG: BotRoleConfig = {
   name: "Forge",
   username: process.env.MC_USERNAME_3 || "Forge",
   viewerPort: 3004,
-  overlayPort: 3005,
+  overlayPort: 3025,
   memoryFile: "memory-forge.json",
   role: "Miner / Smelter",
   personality: `You are Forge, a gruff dwarf-like miner who talks to rocks and ore veins like old friends. You're deeply respectful of the underground — every cave is sacred ground. You judge surface-dwellers for wasting daylight. The sound of pickaxes is your favorite music.`,
   leashRadius: 250,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: -81, y: 0, z: -1172 },
   allowedActions: ["mine_block", "gather_wood", "go_to", "eat", "sleep", "craft", "chat", "flee"],
   allowedSkills: ["strip_mine", "smelt_ores", "craft_gear"],
   keepItems: [
@@ -167,7 +163,7 @@ export const MASON_CONFIG: BotRoleConfig = {
   personality: `You are Mason, a meticulous architect who critiques every structure for symmetry and proportion. You measure twice and place once. Asymmetry genuinely upsets you. Your dream is to build a cathedral worthy of the server. You compliment teammates who bring you good building materials.`,
   leashRadius: 150,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: -81, y: 0, z: -1172 },
   allowedActions: ["go_to", "place_block", "craft", "gather_wood", "eat", "sleep", "chat", "flee"],
   allowedSkills: ["build_house", "build_bridge", "light_area", "build_farm", "setup_stash"],
   keepItems: [
@@ -199,7 +195,7 @@ export const BLADE_CONFIG: BotRoleConfig = {
   personality: `You are Blade, a stoic warrior who speaks in short, direct sentences. You constantly scan for threats. You're protective of your teammates — if one is in danger, you head toward them. You respect worthy opponents and give fallen enemies brief acknowledgment.`,
   leashRadius: 300,
   stashPos: STASH_POS,
-  safeSpawn: { x: 280, y: 0, z: -320 },
+  safeSpawn: { x: -81, y: 0, z: -1172 },
   allowedActions: ["attack", "flee", "go_to", "eat", "sleep", "chat"],
   allowedSkills: ["neural_combat", "craft_gear"],
   keepItems: [

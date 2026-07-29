@@ -64,13 +64,13 @@ export const buildFarmSkill: Skill = {
       if (signal.aborted) return { success: false, message: "Interrupted while traveling to the farm site." };
       // A probe proved findBlock sees the water INSTANTLY when the bot is
       // actually at the site — the failures were the bot never arriving
-      // (pathfinding times out over distance). A /tp fallback lived here but
-      // violated the no-cheat rule (it was the ONLY command not gated behind
-      // allowInterventions); now it's gated like every other intervention.
-      // With interventions off the bot either walks there or reports failure.
+      // (pathfinding times out over distance). Keep the fallback gated as an
+      // intervention, and use spreadplayers so Minecraft selects the top safe
+      // block near the farm. A raw /tp to FARM_SITE repeatedly placed Flora
+      // inside a wall at (-74.5, 81, -1171.5), causing a suffocation loop.
       if (bot.entity.position.distanceTo(new Vec3(fx0, bot.entity.position.y, fz0)) > 6) {
         if (config.bot.allowInterventions) {
-          bot.chat(`/tp ${bot.username} ${fx0} ${Number(params.y) + 1 || 64} ${fz0}`);
+          bot.chat(`/spreadplayers ${fx0} ${fz0} 0 6 false ${bot.username}`);
           await new Promise((r) => setTimeout(r, 2500));
           await bot.waitForChunksToLoad().catch(() => {});
           await new Promise((r) => setTimeout(r, 1500));
