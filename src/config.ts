@@ -24,7 +24,7 @@ export const config = {
     enabled: !!process.env.TWITCH_CHANNEL,
   },
   bot: {
-    name: process.env.BOT_NAME || "Atlas",
+    name: process.env.BOT_NAME || "Milo",
     decisionIntervalMs: parseInt(process.env.BOT_DECISION_INTERVAL_MS || "500"),
     chatCooldownMs: parseInt(process.env.BOT_CHAT_COOLDOWN_MS || "3000"),
     /**
@@ -39,9 +39,12 @@ export const config = {
     idleIntervalMs: parseInt(process.env.BOT_IDLE_INTERVAL_MS || "10000"),
     /** Enable the critic step after each action (uses an extra LLM call per action). */
     criticEnabled: process.env.BOT_CRITIC_ENABLED !== "false",
+    /** Unverified Voyager/generated routines stay unavailable until explicitly opted in. */
+    dynamicSkillsEnabled: process.env.ENABLE_DYNAMIC_SKILLS === "true",
   },
   multiBot: {
-    enabled: process.env.ENABLE_MULTI_BOT === "true",
-    count: parseInt(process.env.BOT_COUNT || "1"),
+    // The default swarm is all three roster members; set false for Milo-only mode.
+    enabled: process.env.ENABLE_MULTI_BOT !== "false",
+    count: parseInt(process.env.BOT_COUNT || "3"),
   },
 };

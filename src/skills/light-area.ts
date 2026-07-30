@@ -1,10 +1,12 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
+import { safeGoto } from "../bot/navigation.js";
 
-export const lightAreaSkill: Skill = {
+export const lightAreaSkill = defineSkill({
   name: "light_area",
   description:
     "Place torches in a grid pattern around the bot (every 5 blocks, 15-block radius). Uses torches from inventory.",
@@ -92,7 +94,7 @@ export const lightAreaSkill: Skill = {
           moves.scafoldingBlocks = [];
           bot.pathfinder.setMovements(moves);
           await Promise.race([
-            bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 3)),
+            safeGoto(bot, new goals.GoalNear(pos.x, pos.y, pos.z, 3), 10_000),
             new Promise<void>((_, rej) =>
               setTimeout(() => {
                 bot.pathfinder.stop();
@@ -151,7 +153,7 @@ export const lightAreaSkill: Skill = {
       stats: { torchesPlaced: placed },
     };
   },
-};
+});
 
 /** Craft torches from coal/charcoal + sticks (crafting sticks from planks if needed). */
 async function craftTorches(bot: Bot): Promise<void> {

@@ -62,7 +62,7 @@ const TECH_LADDER: TechStage[] = [
   },
 ];
 
-/** Flora's ladder — farming progression, not mining. */
+/** Ava's ladder - farming progression, not mining. */
 const FARM_LADDER: TechStage[] = [
   {
     name: "wood for the hoe",
@@ -86,7 +86,7 @@ const FARM_LADDER: TechStage[] = [
   },
 ];
 
-/** Blade's ladder — fighting kit, not pickaxes. */
+/** Milo's guard ladder - fighting kit, not pickaxes. */
 const COMBAT_LADDER: TechStage[] = [
   {
     name: "a sword",
@@ -96,7 +96,7 @@ const COMBAT_LADDER: TechStage[] = [
   {
     name: "armor",
     reached: (inv) => [...inv].some((n) => n.includes("chestplate") || n.includes("helmet")),
-    suggestion: "withdraw_stash iron, or hunt mobs while Forge smelts armor materials",
+    suggestion: "withdraw_stash iron, or hunt mobs while Peter smelts armor materials",
   },
   {
     name: "patrol duty",
@@ -107,14 +107,14 @@ const COMBAT_LADDER: TechStage[] = [
 
 const ROLE_LADDERS: Record<string, TechStage[]> = {
   "Farmer / Crafter": FARM_LADDER,
-  "Combat / Guard": COMBAT_LADDER,
+  "Explorer / Guard": COMBAT_LADDER,
 };
 
 /**
  * One-line tech status for the strategic context, e.g.:
  * "TECH TREE: reached [wood, crafting table]. NEXT: wooden tools — craft {...}"
  * Role-aware: the farmer gets a farming ladder, the guard a combat ladder —
- * the generic mining ladder was steering Flora toward copper ore.
+ * the generic mining ladder was steering the farmer toward copper ore.
  * Returns "" when the ladder is complete.
  */
 export function getTechTreeLine(bot: Bot, role?: string): string {

@@ -1,9 +1,12 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
-import { collectNearbyDrops } from "../bot/navigation.js";
+import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
+import { partial } from "../operations/types.js";
+import { verifyAtPosition } from "../verification/world-verifiers.js";
+import { upsertSharedStructure } from "../world/registry.js";
 
 const TUNNEL_LENGTH = 40;
 const TORCH_INTERVAL = 6;
@@ -16,7 +19,7 @@ const TORCH_INTERVAL = 6;
 // the lava lakes (~-50) so it stays lava-safe.
 const TARGET_Y = 16;
 
-export const stripMineSkill: Skill = {
+export const stripMineSkill = defineSkill({
   name: "strip_mine",
   description:
     "Dig a mining tunnel for ores. Staircases down to Y=11 if needed, then mines 30 blocks horizontally with torch lighting. Requires a pickaxe.",
@@ -26,12 +29,24 @@ export const stripMineSkill: Skill = {
     return {};
   },
 
-  async execute(bot, _params, signal, onProgress): Promise<SkillResult> {
+  async execute(bot, _params, signal, onProgress) {
+    const entrance = bot.entity.position.clone();
+    const entranceId = `mine-entrance-${bot.username}`;
     // Verify pickaxe
     const pickaxe = bot.inventory.items().find((i) => i.name.endsWith("_pickaxe"));
     if (!pickaxe) {
       return { success: false, message: "Need a pickaxe! Use craft_gear first, then strip_mine." };
     }
+
+    upsertSharedStructure({
+      id: entranceId,
+      type: "mine_entrance",
+      status: "verified",
+      position: { x: entrance.x, y: entrance.y, z: entrance.z },
+      provenance: "skill",
+      verifiedAt: Date.now(),
+      evidence: { stage: "entrance_registered", safeStanding: true, returnStatus: "pending" },
+    });
 
     let mined = 0;
     const oresFound: string[] = [];
@@ -57,11 +72,12 @@ export const stripMineSkill: Skill = {
       });
       const digMoves = new Movements(bot);
       digMoves.canDig = true;
-      digMoves.allow1by1towers = true;
+      digMoves.allow1by1towers = false;
+      digMoves.maxDropDown = 1;
       bot.pathfinder.setMovements(digMoves);
       try {
         await Promise.race([
-          bot.pathfinder.goto(new goals.GoalY(TARGET_Y)),
+          safeGoto(bot, new goals.GoalY(TARGET_Y), 60_000),
           new Promise<void>((_, rej) =>
             setTimeout(() => {
               bot.pathfinder.stop();
@@ -75,6 +91,15 @@ export const stripMineSkill: Skill = {
       // Collect anything the descent dropped (ore dug on the way down).
       await collectNearbyDrops(bot, 4, 3000);
       console.log(`[Skill] strip_mine descended to Y=${bot.entity.position.y.toFixed(0)}`);
+      upsertSharedStructure({
+        id: entranceId,
+        type: "mine_entrance",
+        status: "verified",
+        position: { x: entrance.x, y: entrance.y, z: entrance.z },
+        provenance: "skill",
+        verifiedAt: Date.now(),
+        evidence: { stage: "descended", depth: Math.floor(bot.entity.position.y), safeStanding: true, returnStatus: "pending" },
+      });
     }
 
     // --- Phase 2: Horizontal mining tunnel ---
@@ -96,6 +121,15 @@ export const stripMineSkill: Skill = {
         const b = bot.blockAt(t);
         if (!b || b.name === "air") continue;
         if (b.name === "bedrock") {
+          const returned = await returnToEntrance(bot, entrance, signal);
+          const postconditions = verifyAtPosition(bot, entrance, 3);
+          if (!returned) {
+            return partial("MINING_COMPLETE_RETURN_FAILED", `Mined ${mined} blocks but could not return to the entrance.`, {
+              progress: { blocksMined: mined, oresFound: oresFound.length },
+              postconditions,
+              retryable: true,
+            });
+          }
           return {
             success: true,
             message: `Hit bedrock at step ${step}! Mined ${mined} blocks. ${formatOres(oresFound)}`,
@@ -142,6 +176,7 @@ export const stripMineSkill: Skill = {
     }
 
     if (mined === 0) {
+      await returnToEntrance(bot, entrance, signal);
       return { success: false, message: "Couldn't mine anything. Pickaxe might have broken." };
     }
 
@@ -150,13 +185,62 @@ export const stripMineSkill: Skill = {
     // bot never actually had iron to smelt. Walk back over the tunnel.
     await collectNearbyDrops(bot, 16, 8000);
 
+    const tunnelEndpoint = bot.entity.position.clone();
+    const returned = await returnToEntrance(bot, entrance, signal);
+    const postconditions = verifyAtPosition(bot, entrance, 3);
+    if (!returned) {
+      return partial("MINING_COMPLETE_RETURN_FAILED", `Mined ${mined} blocks but could not return to the entrance.`, {
+        progress: { blocksMined: mined, oresFound: oresFound.length },
+        postconditions,
+        retryable: true,
+      });
+    }
+
+    upsertSharedStructure({
+      id: entranceId,
+      type: "mine_entrance",
+      status: "verified",
+      position: { x: entrance.x, y: entrance.y, z: entrance.z },
+      provenance: "skill",
+      verifiedAt: Date.now(),
+      evidence: {
+        stage: "round_trip_complete",
+        tunnelEndpoint: { x: tunnelEndpoint.x, y: tunnelEndpoint.y, z: tunnelEndpoint.z },
+        blocksMined: mined,
+        oresFound: oresFound.length,
+        returnStatus: "verified",
+      },
+    });
+
     return {
       success: true,
       message: `Strip mine complete! Dug ${TUNNEL_LENGTH}-block tunnel, mined ${mined} blocks total. ${formatOres(oresFound)}`,
       stats: { blocksMined: mined, oresFound: oresFound.length },
     };
   },
-};
+});
+
+async function returnToEntrance(bot: Bot, entrance: Vec3, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  const moves = new Movements(bot);
+  moves.canDig = true;
+  moves.allow1by1towers = true;
+  bot.pathfinder.setMovements(moves);
+  try {
+    await Promise.race([
+      safeGoto(bot, new goals.GoalNear(entrance.x, entrance.y, entrance.z, 2), 45_000),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => {
+          bot.pathfinder.stop();
+          reject(new Error("return timeout"));
+        }, 45_000),
+      ),
+    ]);
+    return bot.entity.position.distanceTo(entrance) <= 3;
+  } catch {
+    return false;
+  }
+}
 
 // --- Helpers ---
 
@@ -263,7 +347,7 @@ async function moveToPosition(bot: Bot, targetPos: Vec3): Promise<void> {
     // Bounded: an unreachable GoalBlock here hung strip_mine (and the whole
     // bot) for ~13h. Race against a timeout that stops the pathfinder.
     await Promise.race([
-      bot.pathfinder.goto(new goals.GoalBlock(targetPos.x, targetPos.y, targetPos.z)),
+      safeGoto(bot, new goals.GoalBlock(targetPos.x, targetPos.y, targetPos.z), 8_000),
       new Promise<void>((_, rej) =>
         setTimeout(() => {
           bot.pathfinder.stop();

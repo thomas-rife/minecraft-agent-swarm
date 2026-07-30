@@ -2,22 +2,23 @@
 // Bootstraps the shared stash — crafts & places a double chest at the stash position.
 
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { LOG_TYPES, PLANK_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
-import { safeGoto } from "../bot/actions.js";
+import { safeGoto } from "../bot/navigation.js";
 
-export const setupStashSkill: Skill = {
+export const setupStashSkill = defineSkill({
   name: "setup_stash",
   description:
     "Bootstrap the shared stash: walk to the stash position, craft 2 chests if needed, and place them as a double chest. Requires logs or planks in inventory.",
   params: {
-    x: { type: "number", description: "Stash X coordinate" },
-    y: { type: "number", description: "Stash Y coordinate" },
-    z: { type: "number", description: "Stash Z coordinate" },
+    x: { type: "number", description: "Canonical stash X coordinate", required: true, source: "system" },
+    y: { type: "number", description: "Canonical stash Y coordinate", required: true, source: "system" },
+    z: { type: "number", description: "Canonical stash Z coordinate", required: true, source: "system" },
   },
 
   estimateMaterials(_bot, _params) {
@@ -201,7 +202,7 @@ export const setupStashSkill: Skill = {
         // Navigate to crafting table
         try {
           setMovements(bot);
-          await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+          await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
         } catch {
           /* try anyway */
         }
@@ -325,7 +326,7 @@ export const setupStashSkill: Skill = {
       stats: { chestsPlaced: 2 },
     };
   },
-};
+});
 
 // --- Helpers ---
 
@@ -443,7 +444,7 @@ async function placeChestAt(bot: Bot, targetPos: Vec3): Promise<boolean> {
   if (dist > 4) {
     try {
       setMovements(bot);
-      await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
+      await safeGoto(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), 15_000);
     } catch {
       /* try anyway */
     }

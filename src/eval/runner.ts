@@ -3,8 +3,6 @@ import { skillRegistry } from "../skills/registry.js";
 import { runSkill, abortActiveSkill } from "../skills/executor.js";
 import { getDynamicSkillNames } from "../skills/dynamic-loader.js";
 
-const SUCCESS_PATTERNS =
-  /complet|harvest|built|planted|smelted|crafted|arriv|gather|mined|caught|lit|bridg|chop|killed|ate|placed|fished|explored/i;
 const EVAL_TIMEOUT_MS = 90_000;
 
 export interface EvalResult {
@@ -25,15 +23,16 @@ export async function evalSkill(bot: Bot, skillName: string): Promise<EvalResult
   bot.chat(`[EVAL] Running: ${skillName}...`);
   try {
     let resultMessage = "no result";
+    let passed = false;
     const skillPromise = runSkill(bot, skill, {}).then((r) => {
-      resultMessage = r;
+      resultMessage = r.message;
+      passed = r.status === "succeeded";
     });
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error(`Timed out after ${EVAL_TIMEOUT_MS / 1000}s`)), EVAL_TIMEOUT_MS),
     );
     await Promise.race([skillPromise, timeoutPromise]);
 
-    const passed = SUCCESS_PATTERNS.test(resultMessage);
     const durationMs = Date.now() - start;
     bot.chat(
       `[EVAL] ${passed ? "PASS" : "FAIL"} ${skillName} (${(durationMs / 1000).toFixed(1)}s): ${resultMessage.slice(0, 80)}`,

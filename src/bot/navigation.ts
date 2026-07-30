@@ -1,6 +1,22 @@
 import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
+import { getSharedStructure } from "../world/registry.js";
+
+interface NavigationRecoveryRequest {
+  reason: string;
+  requestedAt: number;
+  causes: string[];
+}
+
+const recoveryRequests = new WeakMap<Bot, NavigationRecoveryRequest>();
+
+export function consumeNavigationRecoveryRequest(bot: Bot): NavigationRecoveryRequest | null {
+  const request = recoveryRequests.get(bot) ?? null;
+  recoveryRequests.delete(bot);
+  return request;
+}
 
 /** Create safe movement defaults — no digging, no block placement, just walk/jump */
 export function safeMoves(bot: Bot): InstanceType<typeof Movements> {
@@ -42,10 +58,77 @@ export function explorerMoves(bot: Bot): InstanceType<typeof Movements> {
  * - Cancels if bot hasn't moved more than 0.3 blocks in 5 seconds AFTER movement begins
  * - `stallStartDelayMs`: grace period before stall detection activates (use when thinkTimeout is high)
  */
+export class NavigationRecoveryError extends Error {
+  constructor(
+    message: string,
+    readonly attempts: number,
+    readonly causes: string[],
+  ) {
+    super(message);
+    this.name = "NavigationRecoveryError";
+  }
+}
+
+function relaxedGoal(goal: any, extraRadius: number): any {
+  if (!Number.isFinite(goal?.x) || !Number.isFinite(goal?.z)) return goal;
+  if (Number.isFinite(goal?.y)) {
+    const currentRange = Number(goal.range ?? goal.radius ?? 1);
+    return new goals.GoalNear(goal.x, goal.y, goal.z, Math.max(1, currentRange + extraRadius));
+  }
+  return new goals.GoalXZ(goal.x, goal.z);
+}
+
+async function recoveryNudge(bot: Bot): Promise<void> {
+  try {
+    bot.pathfinder.stop();
+    bot.setControlState("back", true);
+    bot.setControlState("jump", true);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+  } finally {
+    for (const control of ["back", "jump", "forward", "left", "right"] as const) {
+      try {
+        bot.setControlState(control, false);
+      } catch {
+        // disconnected during recovery
+      }
+    }
+  }
+}
+
+/** Staged recovery: normal route, fresh replan with wider tolerance, then final alternate approach. */
 export async function safeGoto(bot: Bot, goal: any, timeoutMs = 15000, stallStartDelayMs = 0): Promise<void> {
+  if (
+    ("x" in (goal ?? {}) && !Number.isFinite(goal.x)) ||
+    ("y" in (goal ?? {}) && !Number.isFinite(goal.y)) ||
+    ("z" in (goal ?? {}) && !Number.isFinite(goal.z))
+  ) {
+    throw new NavigationRecoveryError("INVALID_NAVIGATION_TARGET", 0, ["Target contains a non-finite coordinate."]);
+  }
+  const executionBudget = Math.max(600, timeoutMs - 900); // reserve two 450ms recovery nudges
+  const budgets = [0.5, 0.3, 0.2].map((fraction) => Math.max(200, Math.floor(executionBudget * fraction)));
+  const candidates = [goal, relaxedGoal(goal, 1), relaxedGoal(goal, 3)];
+  const causes: string[] = [];
+  for (let index = 0; index < candidates.length; index++) {
+    try {
+      await safeGotoAttempt(bot, candidates[index], budgets[index], Math.min(stallStartDelayMs, budgets[index] / 2));
+      return;
+    } catch (error) {
+      causes.push(error instanceof Error ? error.message : String(error));
+      if (index < candidates.length - 1) await recoveryNudge(bot);
+    }
+  }
+  recoveryRequests.set(bot, { reason: "NO_POSITIONAL_PROGRESS", requestedAt: Date.now(), causes });
+  throw new NavigationRecoveryError("Navigation failed after staged recovery.", candidates.length, causes);
+}
+
+async function safeGotoAttempt(bot: Bot, goal: any, timeoutMs: number, stallStartDelayMs: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let lastPos = bot.entity.position.clone();
     let stallTicks = 0;
+    let bestDistance = goalDistance(bot, goal);
+    let goalProgressTicks = 0;
+    let waterTicks = 0;
+    const repeatedPositions = new Map<string, number>();
     let stallActive = stallStartDelayMs === 0;
     const STALL_CHECK_MS = 1000;
     const STALL_THRESHOLD = 5; // 5 checks of 1s = 5 seconds without progress
@@ -71,14 +154,27 @@ export async function safeGoto(bot: Bot, goal: any, timeoutMs = 15000, stallStar
       if (!stallActive) return;
       const currentPos = bot.entity.position;
       const moved = currentPos.distanceTo(lastPos);
-      if (moved < 0.3) {
+      const distance = goalDistance(bot, goal);
+      if (distance !== null && (bestDistance === null || distance < bestDistance - 0.15)) {
+        bestDistance = distance;
+        goalProgressTicks = 0;
+      } else if (distance !== null) {
+        goalProgressTicks++;
+      }
+      const positionKey = `${Math.floor(currentPos.x * 2)},${Math.floor(currentPos.y * 2)},${Math.floor(currentPos.z * 2)}`;
+      const repeats = (repeatedPositions.get(positionKey) ?? 0) + 1;
+      repeatedPositions.set(positionKey, repeats);
+      const feet = bot.blockAt(currentPos)?.name;
+      const head = bot.blockAt(currentPos.offset(0, 1, 0))?.name;
+      waterTicks = feet === "water" || head === "water" ? waterTicks + 1 : 0;
+      if (moved < 0.3 || repeats >= 4 || goalProgressTicks >= 10) {
         stallTicks++;
         if (stallTicks >= STALL_THRESHOLD) {
           clearTimeout(timeout);
           clearInterval(stallCheck);
           if (stallDelayTimer) clearTimeout(stallDelayTimer);
           bot.pathfinder.stop();
-          reject(new Error("Stuck — not making progress toward goal."));
+          reject(new Error(`NO_POSITIONAL_PROGRESS distance=${distance ?? "unknown"} waterSeconds=${waterTicks}`));
         }
       } else {
         stallTicks = 0;
@@ -101,6 +197,41 @@ export async function safeGoto(bot: Bot, goal: any, timeoutMs = 15000, stallStar
         reject(err);
       });
   });
+}
+
+function goalDistance(bot: Bot, goal: any): number | null {
+  if (!Number.isFinite(goal?.x) || !Number.isFinite(goal?.z)) {
+    return Number.isFinite(goal?.y) ? Math.abs(bot.entity.position.y - goal.y) : null;
+  }
+  return bot.entity.position.distanceTo(new Vec3(goal.x, Number.isFinite(goal?.y) ? goal.y : bot.entity.position.y, goal.z));
+}
+
+/** Return to a verified entrance/safe point, with local dig-out as the fallback. */
+export async function recoverToSafePoint(bot: Bot): Promise<boolean> {
+  const entries = [getSharedStructure(`mine-entrance-${bot.username}`), getSharedStructure(`safe-point-${bot.username}`)]
+    .filter((entry) => entry?.status === "verified" && entry.position)
+    .sort((a, b) => {
+      const ap = a!.position!;
+      const bp = b!.position!;
+      return bot.entity.position.distanceTo(new Vec3(ap.x, ap.y, ap.z)) - bot.entity.position.distanceTo(new Vec3(bp.x, bp.y, bp.z));
+    });
+  const destination = entries[0]?.position;
+  if (destination) {
+    const moves = new Movements(bot);
+    moves.canDig = true;
+    moves.allow1by1towers = bot.inventory.items().some((item) =>
+      item.name.endsWith("_planks") || ["dirt", "cobblestone", "stone"].includes(item.name),
+    );
+    moves.maxDropDown = 1;
+    bot.pathfinder.setMovements(moves);
+    try {
+      await safeGoto(bot, new goals.GoalNear(destination.x, destination.y, destination.z, 2), 35_000);
+      return bot.entity.position.distanceTo(new Vec3(destination.x, destination.y, destination.z)) <= 3;
+    } catch {
+      // Continue with local geometry recovery.
+    }
+  }
+  return digOutIfStuck(bot);
 }
 
 /**

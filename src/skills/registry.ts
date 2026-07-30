@@ -31,16 +31,31 @@ register(setupStashSkill);
 // import dynamic-loader.ts at module load time (TDZ / circular ref issue with tsx/Node ESM).
 
 /** Generate the SKILLS section for the LLM system prompt. */
-export function getSkillPromptLines(): string {
+export function getSkillPromptLines(allowedNames?: readonly string[]): string {
   const lines: string[] = [];
   for (const skill of skillRegistry.values()) {
+    if (allowedNames && !allowedNames.includes(skill.name)) continue;
     const paramStr =
       Object.keys(skill.params).length > 0
         ? `params: { ${Object.entries(skill.params)
-            .map(([k, v]) => `"${k}": ${v.type}`)
+            .map(([k, v]) => `${k}: ${v.type}${v.source === "system" ? " (system-injected)" : ""}`)
             .join(", ")} }`
         : "params: {}";
-    lines.push(`- ${skill.name}: [SKILL] ${skill.description} ${paramStr}`);
+    const contract = skill.contract;
+    lines.push(
+      [
+        `SKILL: ${skill.name}`,
+        `PURPOSE: ${contract?.purpose ?? skill.description}`,
+        `USE WHEN: ${contract?.useWhen ?? "The described outcome is needed."}`,
+        `DO NOT USE WHEN: ${contract?.doNotUseWhen ?? "Its preconditions are not satisfied."}`,
+        `PARAMETERS: ${paramStr}`,
+        `PRECONDITIONS: ${contract?.requiredStatus?.join("; ") ?? "validated at execution time"}`,
+        `SUCCESS: ${contract?.successCriteria?.join("; ") ?? "all observed postconditions pass"}`,
+        `FAILURES: ${contract?.knownFailureCodes?.join(", ") ?? "SKILL_PRECONDITION_FAILED, SKILL_POSTCONDITION_FAILED"}`,
+        `PROGRESS: ${contract?.progressPolicy ?? "machine-readable phase and completion fields"}`,
+        `RECOVERY: ${contract?.recoveryPolicy ?? "cancel, clean up, and replan from fresh state"}`,
+      ].join("\n"),
+    );
   }
-  return lines.join("\n");
+  return lines.join("\n\n");
 }

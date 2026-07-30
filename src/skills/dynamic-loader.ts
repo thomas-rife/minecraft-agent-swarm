@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { Vec3 } from "vec3";
 import { skillRegistry } from "./registry.js";
 import type { Skill } from "./types.js";
+import { defineSkill } from "./define.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "../../");
@@ -217,7 +218,7 @@ function buildDynamicSkill(name: string, filePath: string): Skill {
   // (which failed for arrow functions and was fooled by comments).
   new vm.Script(code);
 
-  return {
+  return defineSkill({
     name,
     description: `Dynamic skill: ${name}`,
     params: {},
@@ -332,7 +333,7 @@ function buildDynamicSkill(name: string, filePath: string): Skill {
         return { success: false, message: `${name} failed: ${err.message}` };
       }
     },
-  };
+  });
 }
 
 const STATIC_SKILL_NAMES = new Set([

@@ -19,16 +19,15 @@ import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import type { Entity } from "prismarine-entity";
 import { config } from "../config.js";
-import { BotRoleConfig, FARM_SITE } from "./role.js";
-import { queryStrategic, queryReactive, queryCritic, chatWithLLM, type LLMMessage } from "../llm/index.js";
+import { BotRoleConfig } from "./role.js";
+import { queryStrategic, queryReactive, chatWithLLM, type LLMMessage } from "../llm/index.js";
 import type { RoleContext } from "../llm/prompts.js";
 import { getWorldContext, isHostile } from "./perception.js";
 import { executeAction } from "./actions.js";
-import { digOutIfStuck, escapeWaterIfDrowning } from "./navigation.js";
 import { updateOverlay, addChatMessage, speakThought, setCurrentBot } from "../stream/overlay.js";
 import { generateSpeech } from "../stream/tts.js";
 import { filterContent, filterChatMessage, filterViewerMessage } from "../safety/filter.js";
-import { abortActiveSkill, isSkillRunning, getActiveSkillName } from "../skills/executor.js";
+import { isSkillRunning, getActiveSkillName } from "../skills/executor.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { getAllMemoryStores } from "./memory-registry.js";
@@ -38,6 +37,28 @@ import { recordAction, recordSkillResult, checkInventoryMilestones } from "./sco
 import { getTechTreeLine } from "./curriculum.js";
 import { recordTrajectory } from "./trajectory.js";
 import { buildStrategicPrompt } from "../llm/prompts.js";
+import type { OperationResult } from "../operations/types.js";
+import { recordDiagnosticOperation } from "../util/diagnostic-log.js";
+import { GoalManager } from "../goals/manager.js";
+import type { GoalPredicate } from "../goals/types.js";
+import { EmergencyManager } from "../recovery/emergency.js";
+import {
+  configureSharedWorldPersistence,
+  formatSharedWorldFacts,
+  getVerifiedStructure,
+  planSharedStructure,
+  verifyCanonicalStash,
+  verifyFarmSite,
+} from "../world/registry.js";
+import {
+  claimTask,
+  configureTaskBoardPersistence,
+  formatTaskBoard,
+  publishTask,
+  recordTaskResult,
+} from "../coordination/task-board.js";
+import { configureStashLedgerPersistence } from "../skills/stash-ledger.js";
+import { cancelActiveOperation } from "../operations/controller.js";
 
 export interface ChatMessage {
   source: "minecraft" | "twitch" | "youtube";
@@ -75,17 +96,21 @@ export class BotBrain {
   // Processing state
   private processing = false;
   private stopped = false;
-  private rescuingFromWater = false;
   private eventQueue: BrainEvent[] = [];
 
   // Timers
   private idleTimer: NodeJS.Timeout | null = null;
   private hostileScanner: NodeJS.Timeout | null = null;
   private overlayInterval: NodeJS.Timeout | null = null;
+  private armorTimer: NodeJS.Timeout | null = null;
+  private recoveryTimer: NodeJS.Timeout | null = null;
+  private registryTimer: NodeJS.Timeout | null = null;
 
   // Decision state (migrated from the old decide() function)
-  private currentGoal = "";
-  private goalStepsLeft = 0;
+  private goalManager = new GoalManager();
+  private emergencyManager = new EmergencyManager();
+  private emergencyResolving = false;
+  private activeTaskId: string | null = null;
   private lastAction = "";
   private lastResultSig = "";
   private sameResultCount = 0;
@@ -150,6 +175,10 @@ export class BotBrain {
   private STRATEGIC_COOLDOWN_MS = 8000;
   private CRITIC_ENABLED = true;
 
+  private get currentGoal(): string {
+    return this.goalManager.getActive()?.description ?? "";
+  }
+
   constructor(bot: Bot, roleConfig: BotRoleConfig, events: BrainEvents, memStore: BotMemoryStore) {
     this.bot = bot;
     this.roleConfig = roleConfig;
@@ -158,6 +187,10 @@ export class BotBrain {
     this.log = createLogger(roleConfig.name);
     this.homePos = roleConfig.homePos ?? null;
     this.IDLE_INTERVAL_MS = config.bot.idleIntervalMs ?? 10_000;
+    configureSharedWorldPersistence();
+    configureTaskBoardPersistence();
+    configureStashLedgerPersistence();
+    if (roleConfig.stashPos) planSharedStructure("shared-stash", "stash", roleConfig.stashPos);
 
     // Pre-populate failure blacklist from memory
     for (const [skill, msg] of memStore.getSessionPreconditionBlocks()) {
@@ -225,29 +258,40 @@ export class BotBrain {
 
     // 0. Auto-equip armor on spawn and every 20s thereafter
     this.equipBestArmor().catch(() => {});
-    const armorTimer = setInterval(() => this.equipBestArmor().catch(() => {}), 20_000);
-    armorTimer.unref?.();
+    this.armorTimer = setInterval(() => this.equipBestArmor().catch(() => {}), 20_000);
+    this.armorTimer.unref?.();
 
     // 0b. Self-unstick: if boxed into a hole, dig out (own hands, not a TP).
     // Skip while a skill runs (e.g. strip_mine intentionally digs down).
-    const unstickTimer = setInterval(() => {
-      if (!this.processing && !isSkillRunning(this.bot)) digOutIfStuck(this.bot).catch(() => {});
-    }, 25_000);
-    unstickTimer.unref?.();
+    this.recoveryTimer = setInterval(() => {
+      const emergency = this.emergencyManager.observe(this.bot);
+      if (emergency && !this.emergencyResolving) {
+        this.emergencyResolving = true;
+        this.emergencyManager.resolve(this.bot).then((result) => {
+          if (result) {
+            this.events.onAction(emergency.kind, result.message);
+            recordDiagnosticOperation(this.roleConfig.name, `recovery:${emergency.kind}`, result, true);
+          }
+        }).catch(() => {}).finally(() => {
+          this.emergencyResolving = false;
+        });
+      }
+    }, 3_000);
+    this.recoveryTimer.unref?.();
+
+    this.registryTimer = setInterval(() => {
+      const stash = this.roleConfig.stashPos;
+      if (!stash || this.processing || isSkillRunning(this.bot)) return;
+      if (this.bot.entity.position.distanceTo(new Vec3(stash.x, stash.y, stash.z)) > 48) return;
+      verifyCanonicalStash(this.bot, "shared-stash", stash).catch(() => {});
+    }, 45_000);
+    this.registryTimer.unref?.();
 
     // 0c. Anti-drown: ~90% of all deaths were bots drowning in the stash water
     // pit. Drowning kills in ~15s, so check often and swim out even mid-action
     // (this overrides whatever the bot is doing — staying alive comes first).
-    const drownTimer = setInterval(() => {
-      if (this.rescuingFromWater) return;
-      this.rescuingFromWater = true;
-      escapeWaterIfDrowning(this.bot)
-        .catch(() => {})
-        .finally(() => {
-          this.rescuingFromWater = false;
-        });
-    }, 3000);
-    drownTimer.unref?.();
+    // EmergencyManager handles water and trapped recovery through the same
+    // cancellable operation controller used by actions and skills.
 
     // 2. Hostile scanner — checks for nearby threats every 2s
     this.hostileScanner = setInterval(() => this.scanHostiles(), this.HOSTILE_CHECK_MS);
@@ -298,6 +342,17 @@ export class BotBrain {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.hostileScanner) clearInterval(this.hostileScanner);
     if (this.overlayInterval) clearInterval(this.overlayInterval);
+    if (this.armorTimer) clearInterval(this.armorTimer);
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    if (this.registryTimer) clearInterval(this.registryTimer);
+    this.idleTimer = null;
+    this.hostileScanner = null;
+    this.overlayInterval = null;
+    this.armorTimer = null;
+    this.recoveryTimer = null;
+    this.registryTimer = null;
+    this.eventQueue.length = 0;
+    void cancelActiveOperation(this.bot);
   }
 
   /** Queue a chat message for processing. */
@@ -478,8 +533,8 @@ export class BotBrain {
       if (feetNow?.name !== "water" && headNow?.name !== "water") return false;
 
       if (this.roleConfig.safeSpawn) {
-        const { x, z } = this.roleConfig.safeSpawn;
-        this.log.debug("Brain", `In water — TPing to safeSpawn (${x},80,${z})`);
+        const { x, y, z } = this.roleConfig.safeSpawn;
+        this.log.debug("Brain", `In water — returning near home base (${x},${y},${z})`);
         // spreadplayers lands on the topmost safe block — a raw /tp X 80 Z
         // materialized bots inside hills taller than Y=80 (suffocation deaths)
         this.bot.chat(`/spreadplayers ${x} ${z} 0 2 false ${this.bot.username}`);
@@ -527,10 +582,11 @@ export class BotBrain {
     const techLine = getTechTreeLine(this.bot, this.roleConfig.role);
     if (techLine) ctx += `\n\n${techLine}`;
 
-    // Current goal
-    if (this.currentGoal && this.goalStepsLeft > 0) {
-      ctx += `\n\nCURRENT GOAL: "${this.currentGoal}" (${this.goalStepsLeft} steps left). Continue.`;
-    }
+    const activeGoal = this.goalManager.getActive();
+    if (activeGoal) ctx += `\n\nCURRENT GOAL: "${activeGoal.description}". Continue until its predicate is satisfied.`;
+
+    ctx += `\n\n${formatSharedWorldFacts()}`;
+    ctx += `\n\n${formatTaskBoard()}`;
 
     // Last action result
     if (this.lastAction && this.lastResult) {
@@ -610,7 +666,7 @@ export class BotBrain {
     }
 
     const decision = await queryReactive(this.roleConfig.name, situation, this.roleConfig.allowedActions);
-    await this.executeDecision(decision);
+    await this.executeDecision(decision, "reactive");
   }
 
   private async handleChat(event: BrainEvent): Promise<void> {
@@ -685,7 +741,7 @@ export class BotBrain {
       if (dist >= this.roleConfig.leashRadius * 1.5) {
         this.log.info("Brain", `LEASH: ${dist.toFixed(0)} blocks away — forcing return home`);
         const result = await executeAction(this.bot, "go_to", this.homePos);
-        this.events.onAction("go_to", result);
+        this.events.onAction("go_to", result.message);
         return;
       }
     }
@@ -721,14 +777,14 @@ export class BotBrain {
         this.log.info("Brain", "OVERRIDE: materials ready and no stash chest — running setup_stash");
         this.events.onThought("The Stash must rise. I have the materials. No more excuses.");
         const result = await executeAction(this.bot, "invoke_skill", { skill: "setup_stash", x, y, z });
-        this.events.onAction("setup_stash", result);
+        this.events.onAction("setup_stash", result.message);
         this.lastAction = "setup_stash";
-        this.lastResult = result;
+        this.lastResult = result.message;
         this.trackFailure(
           "skill:setup_stash",
           { action: "setup_stash", params: {} },
           result,
-          /bootstrapped|already/i.test(result),
+          result.status === "succeeded",
         );
         return;
       }
@@ -766,15 +822,15 @@ export class BotBrain {
         this.lastFarmOverrideMs = Date.now();
         this.log.info("Brain", "OVERRIDE: no farm exists — running build_farm (self-sufficient)");
         this.events.onThought("The fields call to me. Today the farm gets BUILT — no more excuses.");
-        const result = await executeAction(this.bot, "invoke_skill", { skill: "build_farm", ...FARM_SITE });
-        this.events.onAction("build_farm", result);
+        const result = await executeAction(this.bot, "invoke_skill", { skill: "build_farm" });
+        this.events.onAction("build_farm", result.message);
         this.lastAction = "build_farm";
-        this.lastResult = result;
+        this.lastResult = result.message;
         this.trackFailure(
           "skill:build_farm",
           { action: "build_farm", params: {} },
           result,
-          /complete|harvest|planted/i.test(result),
+          result.status === "succeeded",
         );
         return;
       }
@@ -804,14 +860,14 @@ export class BotBrain {
         this.log.info("Brain", "OVERRIDE: no iron yet — running strip_mine for ore");
         this.events.onThought("The deep calls. Time to carve for iron — pickaxe in hand, downward!");
         const result = await executeAction(this.bot, "invoke_skill", { skill: "strip_mine" });
-        this.events.onAction("strip_mine", result);
+        this.events.onAction("strip_mine", result.message);
         this.lastAction = "strip_mine";
-        this.lastResult = result;
+        this.lastResult = result.message;
         this.trackFailure(
           "skill:strip_mine",
           { action: "strip_mine", params: {} },
           result,
-          /mined|ore|iron|complete/i.test(result),
+          result.status === "succeeded",
         );
         return;
       }
@@ -830,7 +886,7 @@ export class BotBrain {
     };
 
     const decision = await queryStrategic(context, this.recentHistory, memoryCtx, role);
-    await this.executeDecision(decision);
+    await this.executeDecision(decision, "strategic");
 
     // Capture the trajectory for fine-tuning: exact prompt -> decision -> outcome
     recordTrajectory({
@@ -846,54 +902,39 @@ export class BotBrain {
 
   private async handleCritic(event: BrainEvent): Promise<void> {
     if (!this.CRITIC_ENABLED) return;
-    const { action, result, goal } = event.data ?? {};
+    const { action, result } = event.data ?? {};
     if (!action || !result) return;
 
     // Skip critic for trivial actions
     if (["idle", "chat", "respond_to_chat"].includes(action)) return;
 
-    const criticContext = [
-      `Action: ${action}`,
-      `Result: ${result}`,
-      goal ? `Goal: ${goal} (${this.goalStepsLeft} steps left)` : "No active goal.",
-      `Health: ${this.bot.health}/20, Food: ${this.bot.food}/20`,
-      `Inventory: ${
-        this.bot.inventory
-          .items()
-          .map((i) => `${i.name}x${i.count}`)
-          .join(", ") || "empty"
-      }`,
-    ].join("\n");
+    const operation = result as OperationResult;
+    this.events.onThought(`[critic] ${operation.status}: ${operation.code}`);
 
-    const verdict = await queryCritic(this.roleConfig.name, criticContext, this.roleConfig.allowedActions);
-
-    // Update thought display
-    if (verdict.thought) {
-      this.events.onThought(`[critic] ${verdict.thought}`);
-    }
-
-    if (verdict.goalComplete) {
+    const resolvedGoal = this.goalManager.evaluate(this.bot);
+    if (resolvedGoal?.status === "completed") {
       this.log.info("Brain:critic", `Goal "${this.currentGoal}" complete. Re-planning.`);
-      this.currentGoal = "";
-      this.goalStepsLeft = 0;
-      // Trigger strategic re-plan after a brief pause
-      setTimeout(() => this.triggerReplan(), 1000);
-    } else if (verdict.nextAction && verdict.success) {
-      // Critic suggests next step — execute directly without full LLM call
-      this.log.debug("Brain:critic", `Next step: ${verdict.nextAction}`);
-      await this.executeDecision({
-        thought: verdict.thought,
-        action: verdict.nextAction,
-        params: verdict.nextParams,
-      });
-    } else if (!verdict.success) {
-      // Action failed — trigger strategic re-plan
-      this.log.info("Brain:critic", "Action failed. Re-planning.");
-      setTimeout(() => this.triggerReplan(), 500);
     }
+    // Never chain from stale critic context. Refresh perception before the next choice.
+    setTimeout(() => this.triggerReplan(), operation.status === "succeeded" ? 1000 : 500);
   }
 
   // ─── Action execution ─────────────────────────────────────────────────────
+
+  private goalPredicateFor(action: string, params: Record<string, any>): GoalPredicate {
+    if (["go_to", "navigate", "navigate_to"].includes(action)) {
+      const coordinates = params.coordinates;
+      const x = params.x ?? coordinates?.[0];
+      const y = params.y ?? (coordinates?.length >= 3 ? coordinates[1] : this.bot.entity.position.y);
+      const z = params.z ?? (coordinates?.length >= 3 ? coordinates[2] : coordinates?.[1]);
+      if ([x, y, z].every(Number.isFinite)) return { kind: "at_position", position: { x, y, z }, tolerance: 3 };
+    }
+    if (["flee", "flee_to_safety"].includes(action)) return { kind: "not_in_water" };
+    const skill = action === "invoke_skill" ? params.skill : action;
+    if (skill === "setup_stash") return { kind: "structure_verified", structureId: "shared-stash" };
+    if (skill === "build_farm") return { kind: "structure_verified", structureId: "shared-farm" };
+    return { kind: "operation_succeeded" };
+  }
 
   private async executeDecision(decision: {
     thought: string;
@@ -901,7 +942,7 @@ export class BotBrain {
     params: Record<string, any>;
     goal?: string;
     goalSteps?: number;
-  }): Promise<void> {
+  }, scope: "strategic" | "reactive" | "critic" = "strategic"): Promise<void> {
     // Filter thought for safety
     const thoughtFilter = filterContent(decision.thought);
     if (!thoughtFilter.safe) {
@@ -920,6 +961,27 @@ export class BotBrain {
     this.events.onThought(decision.thought);
     this.log.info("Brain", `"${decision.thought}" → ${decision.action}`);
     this.log.debug("Brain", "Decision params:", JSON.stringify(decision.params));
+
+    const strategicActions = new Set([
+      "explore",
+      "idle",
+      "respond_to_chat",
+      "invoke_skill",
+      "deposit_stash",
+      "withdraw_stash",
+    ]);
+    if (
+      scope === "strategic" &&
+      !strategicActions.has(decision.action) &&
+      !this.roleConfig.allowedSkills.includes(decision.action)
+    ) {
+      const gateMsg = `Strategic decisions may select only high-level skills or ${[...strategicActions].join(", ")}.`;
+      this.events.onAction(decision.action, gateMsg);
+      this.lastResult = gateMsg;
+      this.blockAction(decision.action, gateMsg, BotBrain.FAILURE_TTL_STRUCTURAL_MS);
+      setTimeout(() => this.triggerReplan(), 300);
+      return;
+    }
 
     // Update overlay
     updateOverlay({
@@ -952,6 +1014,19 @@ export class BotBrain {
       delete decision.params.skill;
     }
 
+    if (
+      decision.action === "invoke_skill" &&
+      (!decision.params?.skill || !this.roleConfig.allowedSkills.includes(decision.params.skill))
+    ) {
+      const requested = decision.params?.skill ?? "(missing)";
+      const gateMsg = `Skill "${requested}" is not configured for ${this.roleConfig.name}.`;
+      this.log.debug("Brain", `GATED: ${gateMsg}`);
+      this.events.onAction("invoke_skill", gateMsg);
+      this.blockAction(`skill:${requested}`, gateMsg, BotBrain.FAILURE_TTL_STRUCTURAL_MS);
+      this.lastResult = gateMsg;
+      return;
+    }
+
     // ── Action gating ──
     const UNIVERSAL_ACTIONS = new Set([
       "give_item",
@@ -961,7 +1036,6 @@ export class BotBrain {
       "deposit_stash",
       "withdraw_stash",
       "chat",
-      "generate_skill",
       // Every bot must be able to MOVE and LOOK. Withholding "explore" from
       // non-scout roles meant the farmer/builder/guard fired thousands of
       // rejected look_around/scan/explore decisions (27% of Flora's actions
@@ -1038,15 +1112,17 @@ export class BotBrain {
       normalizedParams.protectPos = this.roleConfig.stashPos;
     }
 
-    // Inject the farm site (lake shore) into build_farm so the skill can
-    // travel to water instead of failing "no water within 96 blocks"
+    // Reuse a farm only after the bots have actually built and verified it.
+    // The first farm has no configured coordinates: build_farm selects a site
+    // from observed water and tillable soil, then the registry records it.
     const isBuildFarm =
       decision.action === "build_farm" ||
       (decision.action === "invoke_skill" && normalizedParams.skill === "build_farm");
-    if (isBuildFarm && normalizedParams.x === undefined) {
-      normalizedParams.x = FARM_SITE.x;
-      normalizedParams.y = FARM_SITE.y;
-      normalizedParams.z = FARM_SITE.z;
+    const verifiedFarm = isBuildFarm ? getVerifiedStructure("farm") : undefined;
+    if (verifiedFarm?.position && normalizedParams.x === undefined) {
+      normalizedParams.x = verifiedFarm.position.x;
+      normalizedParams.y = verifiedFarm.position.y;
+      normalizedParams.z = verifiedFarm.position.z;
     }
     // build_farm's bake step withdraws pooled wheat from the stash to bake a
     // real bread batch (harvests are too small/scattered to bake individually).
@@ -1102,12 +1178,38 @@ export class BotBrain {
       normalizedParams.stashPos = this.roleConfig.stashPos;
     }
 
+    if (decision.goal && !this.goalManager.getActive()) {
+      const goal = this.goalManager.setGoal({
+        type: "strategic",
+        description: decision.goal,
+        completion: this.goalPredicateFor(decision.action, normalizedParams),
+        source: "llm",
+      });
+      this.activeTaskId = goal.id;
+      publishTask({
+        id: goal.id,
+        capability: decision.action === "invoke_skill" ? normalizedParams.skill : decision.action,
+        description: decision.goal,
+      });
+      claimTask(goal.id, this.roleConfig.name);
+    } else if (this.activeTaskId) {
+      claimTask(this.activeTaskId, this.roleConfig.name);
+    }
+
     // ── Execute ──
     const result = await executeAction(this.bot, decision.action, normalizedParams);
     this.lastAction = decision.action;
-    this.lastResult = result;
-    this.events.onAction(decision.action, result);
-    this.log.info("Brain", `Result: ${result}`);
+    this.lastResult = result.message;
+    this.events.onAction(decision.action, result.message);
+    this.log.info(
+      "Brain",
+      `Result [${result.status}/${result.code}] operation=${result.operationId ?? "unregistered"} started=${result.startedAt ?? "unknown"} ended=${result.endedAt ?? "unknown"}: ${result.message}`,
+    );
+    this.log.debug(
+      "Brain",
+      "Postcondition evidence:",
+      JSON.stringify({ objective: decision.action, observations: result.observations, postconditions: result.postconditions }),
+    );
 
     // Update team bulletin
     updateBulletin({
@@ -1123,7 +1225,7 @@ export class BotBrain {
       food: this.bot.food,
       timestamp: Date.now(),
       goal: this.currentGoal || decision.goal,
-      lastResult: result.slice(0, 120),
+      lastResult: result.message.slice(0, 120),
     });
 
     // Update overlay with result
@@ -1136,24 +1238,18 @@ export class BotBrain {
         z: this.bot.entity.position.z,
       },
       time: this.bot.time.timeOfDay < 13000 || this.bot.time.timeOfDay > 23000 ? "Daytime" : "Nighttime",
-      actionResult: result,
+      actionResult: result.message,
       inventory: this.bot.inventory.items().map((i) => `${i.name}x${i.count}`),
     });
 
     // ── Track goal ──
-    if (decision.goal) {
-      this.currentGoal = decision.goal;
-      this.goalStepsLeft = decision.goalSteps || 5;
-    }
-
     // ── Scoreboard ──
     // (isSuccess computed below — record after it)
-    const isSuccess =
-      /complet|harvest|built|planted|smelted|crafted|arriv|gather|mined|caught|lit|bridg|chop|killed|ate|explored|placed|fished|sleep|zzz/i.test(
-        result,
-      );
+    const isSuccess = result.status === "succeeded";
+    const completedSkill = decision.action === "invoke_skill" ? normalizedParams.skill : decision.action;
     this.lastActionWasSuccess = isSuccess;
-    recordAction(this.roleConfig.name, decision.action, result, isSuccess);
+    recordAction(this.roleConfig.name, decision.action, result.message, isSuccess);
+    recordDiagnosticOperation(this.roleConfig.name, String(completedSkill ?? decision.action), result);
     if (decision.action === "invoke_skill" || skillRegistry.has(decision.action)) {
       recordSkillResult(this.roleConfig.name, isSuccess);
     }
@@ -1172,7 +1268,7 @@ export class BotBrain {
     // a row is a stuck loop — even if the action reports "success" (e.g. Flora
     // "withdrew" planks 6x that never arrived, or chat begging). Blacklist it
     // briefly and force a re-plan so no buggy effector can trap a bot forever.
-    const resultSig = `${actionKey}|${result.slice(0, 60)}`;
+    const resultSig = `${actionKey}|${result.status}|${result.code}`;
     if (decision.action !== "idle" && resultSig === this.lastResultSig) {
       this.sameResultCount++;
       if (this.sameResultCount >= 2) {
@@ -1189,9 +1285,27 @@ export class BotBrain {
     // Failure tracking
     this.trackFailure(actionKey, decision, result, isSuccess);
 
-    // Track goal steps
-    if (isSuccess && this.goalStepsLeft > 0) {
-      this.goalStepsLeft--;
+    if (result.status === "succeeded" && completedSkill === "setup_stash" && this.roleConfig.stashPos) {
+      await verifyCanonicalStash(this.bot, "shared-stash", this.roleConfig.stashPos);
+    }
+    if (result.status === "succeeded" && completedSkill === "build_farm") {
+      const position = this.bot.entity.position;
+      verifyFarmSite(this.bot, "shared-farm", { x: position.x, y: position.y, z: position.z }, 16);
+    }
+    const completedGoal = this.goalManager.evaluateOperation(this.bot, result);
+    if (this.activeTaskId) {
+      recordTaskResult(
+        this.activeTaskId,
+        completedGoal?.status === "completed"
+          ? result
+          : result.status === "succeeded"
+            ? { ...result, status: "partial", code: "GOAL_POSTCONDITION_PENDING", retryable: true }
+            : result,
+      );
+    }
+    if (completedGoal?.status === "completed") {
+      this.activeTaskId = null;
+      setTimeout(() => this.triggerReplan(), 300);
     }
 
     // Lock home position when first house built
@@ -1204,7 +1318,7 @@ export class BotBrain {
     // Track history
     this.recentHistory.push({
       role: "assistant",
-      content: `I decided to ${decision.action}: ${decision.thought}. Result: ${result}`,
+      content: `I decided to ${decision.action}: ${decision.thought}. Result [${result.code}]: ${result.message}`,
     });
     if (this.recentHistory.length > 12) {
       this.recentHistory.splice(0, this.recentHistory.length - 8);
@@ -1243,18 +1357,18 @@ export class BotBrain {
   private trackFailure(
     actionKey: string,
     decision: { action: string; params: Record<string, any> },
-    result: string,
+    result: OperationResult,
     isSuccess: boolean,
   ): void {
     // Hallucinated action names
-    if (result.startsWith("Unknown action:")) {
+    if (result.code === "UNKNOWN_ACTION") {
       this.blockAction(decision.action, "Unknown action", BotBrain.FAILURE_TTL_STRUCTURAL_MS);
       return;
     }
 
     // Retired skills — put them straight into the do-NOT-retry prompt list
     // so the LLM stops re-picking them from conversation history.
-    if (result.includes("is RETIRED")) {
+    if (result.code === "SKILL_RETIRED") {
       this.blockAction(
         actionKey,
         "Retired — proven broken, use basic actions instead",
@@ -1272,7 +1386,7 @@ export class BotBrain {
 
     if (!isSkillAction) {
       // Track "attack" no-target failures
-      if (decision.action === "attack" && /no mobs to attack nearby/i.test(result)) {
+      if (decision.action === "attack" && !isSuccess) {
         const prevCount = (this.failureCounts.get("attack") ?? 0) + 1;
         this.failureCounts.set("attack", prevCount);
         if (prevCount >= 3) {
@@ -1286,22 +1400,16 @@ export class BotBrain {
 
     if (isSkillAction) {
       if (!isSuccess) {
-        const isAlreadyRunning = result.startsWith("Already running skill");
+        const isAlreadyRunning = result.code === "SKILL_ALREADY_ACTIVE" || result.code === "OPERATION_ALREADY_ACTIVE";
         const isPreconditionFailure =
-          /missing:|need \d|no water|no trees|no coal|no iron|no pickaxe|Can't craft|could not find|not enough|need to (mine|craft|find|smelt)|Can't sleep|terrain too rough|not nighttime|already sleeping|zzz/i.test(
-            result,
-          );
+          result.code === "SKILL_PRECONDITION_FAILED" || result.code === "MATERIAL_GATHER_FAILED";
 
         if (!isAlreadyRunning && !isPreconditionFailure) {
           const prevCount = (this.failureCounts.get(actionKey) ?? 0) + 1;
           this.failureCounts.set(actionKey, prevCount);
           if (prevCount >= 2) {
-            this.blockAction(actionKey, result.slice(0, 120));
+            this.blockAction(actionKey, `${result.code}: ${result.message.slice(0, 100)}`);
           }
-        } else if (!isAlreadyRunning && /no trees/i.test(result)) {
-          this.blockAction(actionKey, "No trees — explore first");
-        } else if (!isAlreadyRunning && /no water/i.test(result)) {
-          this.blockAction(actionKey, "No water — explore first");
         }
       } else {
         this.failureCounts.delete(actionKey);

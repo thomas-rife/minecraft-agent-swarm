@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
@@ -8,7 +9,7 @@ import mcDataLoader from "minecraft-data";
 import { getBotMemoryStore } from "../bot/memory-registry.js";
 import { config } from "../config.js";
 
-export const buildFarmSkill: Skill = {
+export const buildFarmSkill = defineSkill({
   name: "build_farm",
   description:
     "Build a wheat farm near water. Crafts a hoe, collects seeds, tills soil, plants crops. If mature wheat exists nearby, harvests and replants instead. Takes ~2 minutes.",
@@ -66,8 +67,8 @@ export const buildFarmSkill: Skill = {
       // actually at the site — the failures were the bot never arriving
       // (pathfinding times out over distance). Keep the fallback gated as an
       // intervention, and use spreadplayers so Minecraft selects the top safe
-      // block near the farm. A raw /tp to FARM_SITE repeatedly placed Flora
-      // inside a wall at (-74.5, 81, -1171.5), causing a suffocation loop.
+      // block near the farm. Raw coordinate teleports can place a bot inside
+      // terrain, so travel to a previously verified site uses ground snapping.
       if (bot.entity.position.distanceTo(new Vec3(fx0, bot.entity.position.y, fz0)) > 6) {
         if (config.bot.allowInterventions) {
           bot.chat(`/spreadplayers ${fx0} ${fz0} 0 6 false ${bot.username}`);
@@ -265,7 +266,7 @@ export const buildFarmSkill: Skill = {
     setMovements(bot);
     try {
       await Promise.race([
-        bot.pathfinder.goto(new goals.GoalNear(navigationTarget.x, navigationTarget.y, navigationTarget.z, 3)),
+        safeGoto(bot, new goals.GoalNear(navigationTarget.x, navigationTarget.y, navigationTarget.z, 3), 12_000),
         new Promise<void>((_, rej) =>
           setTimeout(() => {
             bot.pathfinder.stop();
@@ -330,7 +331,7 @@ export const buildFarmSkill: Skill = {
       try {
         setMovements(bot);
         await Promise.race([
-          bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1)),
+          safeGoto(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1), 8_000),
           new Promise<void>((_, rej) =>
             setTimeout(() => {
               bot.pathfinder.stop();
@@ -394,7 +395,7 @@ export const buildFarmSkill: Skill = {
       stats: { cropsPlanted: planted },
     };
   },
-};
+});
 
 // --- Helpers ---
 
@@ -421,7 +422,7 @@ function countItem(bot: Bot, name: string): number {
  *  of the freeze-bug arc. */
 async function gotoT(bot: Bot, goal: InstanceType<typeof goals.GoalNear>, ms = 15000): Promise<void> {
   await Promise.race([
-    bot.pathfinder.goto(goal),
+    safeGoto(bot, goal, ms),
     new Promise<void>((_, rej) =>
       setTimeout(() => {
         bot.pathfinder.stop();

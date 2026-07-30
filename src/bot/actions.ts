@@ -14,6 +14,9 @@ import { config } from "../config.js";
 
 import { STASH_POS } from "./role.js";
 import { safeMoves, explorerMoves, safeGoto, collectNearbyDrops } from "./navigation.js";
+import { runControlledOperation } from "../operations/controller.js";
+import { failed, operationResult, succeeded, type OperationResult } from "../operations/types.js";
+import { verifyAtPosition, verifyDryStable } from "../verification/world-verifiers.js";
 export { safeMoves, explorerMoves, safeGoto, collectNearbyDrops };
 
 /** Hard cap for a single DIRECT action. Longer than any legit action (gather
@@ -31,14 +34,27 @@ const DIRECT_ACTION_TIMEOUT_MS = 150_000;
  * invoke_skill / registered-skill names are left to runSkill's own 240s watchdog
  * (double-bounding would preempt legit long skills like build_house).
  */
-export async function executeAction(bot: Bot, action: string, params: Record<string, any>): Promise<string> {
+export async function executeAction(bot: Bot, action: string, params: Record<string, any>): Promise<OperationResult> {
+  const delegatesToSkill = action === "invoke_skill" || skillRegistry.get(action) !== undefined;
+  if (delegatesToSkill) {
+    const result = await executeLegacyAction(bot, action, params);
+    return typeof result === "string" ? failed("SKILL_DISPATCH_REJECTED", result, { retryable: false }) : result;
+  }
+  return runControlledOperation(bot, "action", DIRECT_ACTION_TIMEOUT_MS, async () => {
+    const before = captureActionState(bot);
+    const result = await executeLegacyAction(bot, action, params);
+    return typeof result === "string" ? await verifyDirectAction(bot, action, params, before, result) : result;
+  });
+}
+
+async function executeLegacyAction(bot: Bot, action: string, params: Record<string, any>): Promise<string | OperationResult> {
   const delegatesToSkill = action === "invoke_skill" || skillRegistry.get(action) !== undefined;
   if (delegatesToSkill) {
     return executeActionInner(bot, action, params);
   }
 
   let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<string>((resolve) => {
+  const timeout = new Promise<string | OperationResult>((resolve) => {
     timer = setTimeout(() => {
       try {
         bot.pathfinder.stop();
@@ -62,7 +78,112 @@ export async function executeAction(bot: Bot, action: string, params: Record<str
   }
 }
 
-async function executeActionInner(bot: Bot, action: string, params: Record<string, any>): Promise<string> {
+interface ActionState {
+  position: Vec3;
+  food: number;
+  health: number;
+  inventory: Map<string, number>;
+}
+
+function captureActionState(bot: Bot): ActionState {
+  const inventory = new Map<string, number>();
+  for (const item of bot.inventory.items()) inventory.set(item.name, (inventory.get(item.name) ?? 0) + item.count);
+  return { position: bot.entity.position.clone(), food: bot.food, health: bot.health, inventory };
+}
+
+function itemCount(bot: Bot, name: string): number {
+  return bot.inventory.items().filter((item) => item.name === name).reduce((total, item) => total + item.count, 0);
+}
+
+async function verifyDirectAction(
+  bot: Bot,
+  action: string,
+  params: Record<string, any>,
+  before: ActionState,
+  message: string,
+): Promise<OperationResult> {
+  if (["idle", "chat", "respond_to_chat"].includes(action)) {
+    const valid = action === "idle" || (typeof params.message === "string" && params.message.trim().length > 0);
+    return valid
+      ? succeeded("ACTION_COMPLETED", message, { worldChanged: false })
+      : failed("INVALID_ACTION_PARAMS", message, { retryable: false });
+  }
+  if (action === "generate_skill") {
+    return params.task && String(params.task).trim()
+      ? succeeded("SKILL_GENERATED", message, { worldChanged: false })
+      : failed("INVALID_ACTION_PARAMS", message, { retryable: false });
+  }
+  if (["go_to", "navigate", "navigate_to", "navigate_to_coordinates"].includes(action)) {
+    const coords = params.coordinates;
+    const x = params.x ?? coords?.[0];
+    const y = params.y ?? (coords?.length >= 3 ? coords[1] : undefined);
+    const z = params.z ?? (coords?.length >= 3 ? coords[2] : coords?.[1]);
+    if (![x, y, z].every(Number.isFinite)) return failed("INVALID_COORDINATES", message, { retryable: false });
+    const postconditions = verifyAtPosition(bot, { x, y, z }, 3, before.position);
+    const reached = postconditions.every((condition) => condition.satisfied);
+    return reached
+      ? succeeded("DESTINATION_REACHED", message, { postconditions })
+      : failed("DESTINATION_NOT_REACHED", message, { postconditions, retryable: true });
+  }
+  if (["flee", "flee_to_safety", "prioritize_survival", "navigate_to_safe_location"].includes(action)) {
+    const dry = await verifyDryStable(bot);
+    return dry.satisfied
+      ? succeeded("SAFETY_REACHED", message, { postconditions: [dry] })
+      : failed("STILL_UNSAFE", message, { postconditions: [dry], retryable: true });
+  }
+  if (action === "craft" && typeof params.item === "string") {
+    const delta = itemCount(bot, params.item) - (before.inventory.get(params.item) ?? 0);
+    const postcondition = { name: `inventory_increased:${params.item}`, satisfied: delta > 0, evidence: { delta } };
+    return delta > 0
+      ? succeeded("ITEM_CRAFTED", message, { postconditions: [postcondition] })
+      : failed("CRAFT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
+  }
+  if (action === "eat") {
+    const improved = bot.food > before.food || bot.health > before.health;
+    const postcondition = { name: "nutrition_improved", satisfied: improved, evidence: { before: before.food, after: bot.food } };
+    return improved
+      ? succeeded("FOOD_CONSUMED", message, { postconditions: [postcondition] })
+      : failed("EAT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
+  }
+  if (["explore", "gather_wood", "mine_block", "place_block", "build_shelter"].includes(action)) {
+    const moved = bot.entity.position.distanceTo(before.position) > 1;
+    const inventoryChanged = bot.inventory.items().some((item) => item.count !== (before.inventory.get(item.name) ?? 0));
+    const changed = moved || inventoryChanged;
+    const postcondition = { name: "observable_world_progress", satisfied: changed, evidence: { moved, inventoryChanged } };
+    return changed
+      ? succeeded("ACTION_PROGRESS_VERIFIED", message, { postconditions: [postcondition] })
+      : failed("ACTION_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
+  }
+  if (["attack", "neural_combat", "neural_navigation", "give_item", "sleep", "sleep_in_bed", "use_bed"].includes(action)) {
+    return operationResult("partial", "ACTION_NOT_FULLY_VERIFIABLE", message, { retryable: true, worldChanged: true });
+  }
+  if (action === "deposit_stash" || action === "withdraw_stash") {
+    const beforeTotal = [...before.inventory.values()].reduce((total, count) => total + count, 0);
+    const afterTotal = bot.inventory.items().reduce((total, item) => total + item.count, 0);
+    const requestedItem = typeof params.item === "string" ? params.item : undefined;
+    const requestedCount = Number(params.count) || 1;
+    const itemDelta = requestedItem ? itemCount(bot, requestedItem) - (before.inventory.get(requestedItem) ?? 0) : 0;
+    const satisfied = action === "withdraw_stash" ? itemDelta >= requestedCount : afterTotal < beforeTotal;
+    const partialTransaction = action === "withdraw_stash" ? itemDelta > 0 : afterTotal !== beforeTotal;
+    const postcondition = {
+      name: "inventory_transaction_applied",
+      satisfied,
+      evidence: { action, beforeTotal, afterTotal, requestedItem, requestedCount, itemDelta },
+    };
+    if (satisfied) return succeeded("STASH_TRANSACTION_VERIFIED", message, { postconditions: [postcondition] });
+    if (partialTransaction) {
+      return operationResult("partial", "STASH_TRANSACTION_PARTIAL", message, {
+        postconditions: [postcondition],
+        retryable: true,
+        worldChanged: true,
+      });
+    }
+    return failed("STASH_TRANSACTION_UNVERIFIED", message, { postconditions: [postcondition], retryable: true });
+  }
+  return failed("UNKNOWN_ACTION", message, { retryable: false });
+}
+
+async function executeActionInner(bot: Bot, action: string, params: Record<string, any>): Promise<string | OperationResult> {
   try {
     switch (action) {
       case "gather_wood":
@@ -77,8 +198,8 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
         const coords = params.coordinates;
         const nx = params.x ?? (coords && coords[0]);
         // If only 2 coords given, treat as [x, z] and use bot's current Y
-        const ny = params.y ?? (coords && (coords.length >= 3 ? coords[1] : bot.entity.position.y));
-        const nz = params.z ?? (coords && (coords.length >= 3 ? coords[2] : coords[1]));
+        const ny = params.y ?? (coords && coords.length >= 3 ? coords[1] : undefined);
+        const nz = params.z ?? (coords && coords.length >= 3 ? coords[2] : undefined);
         return await goTo(bot, nx, ny, nz);
       }
       case "explore": {
@@ -126,6 +247,9 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
         return `Replied: ${msg}`;
       }
       case "generate_skill": {
+        if (!config.bot.dynamicSkillsEnabled) {
+          return "Dynamic skill generation is disabled until generated skills have verified contracts.";
+        }
         if (!params.task || !String(params.task).trim()) return "generate_skill needs a non-empty 'task' param.";
         const { generateSkill } = await import("../skills/generator.js");
         const name = await generateSkill(params.task as string);
@@ -139,6 +263,7 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
           return `Skill '${name}' is RETIRED (${st?.successes}/${st?.attempts} success rate — it doesn't work). Use generate_skill to create a better version, or do it with basic actions.`;
         }
         const skill = skillRegistry.get(name);
+        if (!skill && !config.bot.dynamicSkillsEnabled) return `Unverified dynamic skill '${name}' is disabled.`;
         if (!skill) {
           // Fallback: if the skill name is actually a built-in action, execute it directly
           const BUILTIN_ACTIONS = new Set([
@@ -165,14 +290,17 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
         // Voyager-style refinement: a dynamic skill that failed with a CODE
         // error (not a precondition) gets its source + error fed back to the
         // LLM for a fix. Fire-and-forget — the bot keeps playing meanwhile.
-        const looksLikeCodeBug =
-          /is not a function|Cannot read|ReferenceError|TypeError|is not defined|timed out after/i.test(skillResult);
-        const looksLikePrecondition = /need|missing|not enough|no trees|no water|gather|explore first/i.test(
-          skillResult,
-        );
-        if (looksLikeCodeBug && !looksLikePrecondition && getDynamicSkillNames().includes(name)) {
+        const looksLikeCodeBug = skillResult.code === "SKILL_EXECUTOR_CRASHED" || skillResult.code === "OPERATION_CRASHED";
+        const looksLikePrecondition =
+          skillResult.code === "SKILL_PRECONDITION_FAILED" || skillResult.code === "MATERIAL_GATHER_FAILED";
+        if (
+          config.bot.dynamicSkillsEnabled &&
+          looksLikeCodeBug &&
+          !looksLikePrecondition &&
+          getDynamicSkillNames().includes(name)
+        ) {
           import("../skills/generator.js")
-            .then(({ refineSkill }) => refineSkill(name, skillResult))
+            .then(({ refineSkill }) => refineSkill(name, skillResult.message))
             .catch((e) => console.warn(`[Refine] ${name}:`, e.message));
         }
         return skillResult;
@@ -209,7 +337,7 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
       }
     }
   } catch (err: any) {
-    return `Action failed: ${err.message || err}`;
+    throw new Error(`Action failed: ${err.message || err}`, { cause: err });
   }
 }
 
@@ -611,6 +739,11 @@ async function mineBlock(
       ? `No ${blockType} found nearby (the ${PROTECT_RADIUS}-block zone around The Stash is protected — mine elsewhere).`
       : `No ${blockType} found nearby.`;
 
+  const feet = bot.entity.position.floored();
+  if (block.position.x === feet.x && block.position.z === feet.z && block.position.y < feet.y) {
+    return "Refusing to dig the block directly beneath the bot; use the round-trip strip_mine skill.";
+  }
+
   // Allow digging so pathfinder can reach underground ores through stone
   const { Movements } = (await import("mineflayer-pathfinder")).default;
   const digMoves = new Movements(bot);
@@ -695,10 +828,10 @@ async function mineVein(
 }
 
 async function goTo(bot: Bot, x: number, y: number, z: number): Promise<string> {
-  // Default missing coordinates to bot's current position
-  const cx = isFinite(x) ? x : bot.entity.position.x;
-  const cy = isFinite(y) ? y : bot.entity.position.y;
-  const cz = isFinite(z) ? z : bot.entity.position.z;
+  if (![x, y, z].every(Number.isFinite)) return "Invalid destination: x, y, and z must all be finite coordinates.";
+  const cx = x;
+  const cy = y;
+  const cz = z;
 
   // Reject unreasonable distances — LLM often hallucinates coordinates
   const dist = bot.entity.position.distanceTo(new Vec3(cx, cy, cz));

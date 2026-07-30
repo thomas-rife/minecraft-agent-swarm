@@ -1,4 +1,5 @@
 import type { Bot } from "mineflayer";
+import type { OperationResult, PostconditionResult } from "../operations/types.js";
 
 /** A single block placement in a blueprint, relative to origin (0,0,0). */
 export interface BlueprintBlock {
@@ -27,18 +28,40 @@ export interface SkillProgress {
   active: boolean;
 }
 
-/** Result returned when a skill finishes. */
+/**
+ * Legacy result returned by the current deterministic skill implementations.
+ * The executor converts this once, at the skill boundary, into OperationResult.
+ * New skills should return OperationResult directly.
+ */
 export interface SkillResult {
   success: boolean;
   message: string;
   stats?: Record<string, number>;
 }
 
+export interface SkillContract {
+  purpose?: string;
+  useWhen?: string;
+  doNotUseWhen?: string;
+  requiredStatus?: string[];
+  successCriteria?: string[];
+  knownFailureCodes?: string[];
+  progressPolicy?: string;
+  recoveryPolicy?: string;
+  capture?: (bot: Bot, params: Record<string, any>) => unknown;
+  validate?: (params: Record<string, any>) => PostconditionResult[];
+  preconditions?: (bot: Bot, params: Record<string, any>) => Promise<PostconditionResult[]>;
+  postconditions?: (bot: Bot, params: Record<string, any>, baseline: unknown) => Promise<PostconditionResult[]>;
+  retryable?: boolean;
+  timeoutMs?: number;
+}
+
 /** Core skill interface. Every skill implements this. */
 export interface Skill {
   name: string;
   description: string;
-  params: Record<string, { type: string; description: string }>;
+  params: Record<string, { type: string; description: string; required?: boolean; source?: "llm" | "system" }>;
+  contract?: SkillContract;
 
   /** Estimate raw materials needed. Called before execution for the gathering phase. */
   estimateMaterials(bot: Bot, params: Record<string, any>): Record<string, number>;
@@ -49,5 +72,5 @@ export interface Skill {
     params: Record<string, any>,
     signal: AbortSignal,
     onProgress: (progress: SkillProgress) => void,
-  ): Promise<SkillResult>;
+  ): Promise<OperationResult>;
 }

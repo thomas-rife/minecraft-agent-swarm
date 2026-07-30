@@ -9,10 +9,11 @@ import { registerBot as registerViewerBot, isUnifiedViewerStarted } from "../str
 import { startViewer } from "../stream/viewer.js";
 import { addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { abortActiveSkill } from "../skills/executor.js";
+import { cancelActiveOperation } from "../operations/controller.js";
 import { registerBotMemory } from "./memory-registry.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
-import { BotRoleConfig, ATLAS_CONFIG } from "./role.js";
+import { BotRoleConfig, BOT_ROSTER, MILO_CONFIG } from "./role.js";
 import { spawn } from "node:child_process";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -20,6 +21,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { isNeuralServerRunning } from "../neural/bridge.js";
 import { BotBrain, type ChatMessage, type BrainEvents } from "./brain.js";
 import { recordDeath, startScoreboard } from "./scoreboard.js";
+import { recordDiagnosticEvent } from "../util/diagnostic-log.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -42,12 +44,26 @@ async function ensureNeuralServer(): Promise<void> {
       return;
     }
   }
+  recordDiagnosticEvent({
+    type: "neural_server_timeout",
+    severity: "warn",
+    message: "Neural combat server timed out; fallback combat is active.",
+  });
   console.warn("[Bot] Neural server timed out — combat fallback active.");
 }
 
-export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig = ATLAS_CONFIG) {
+export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig = MILO_CONFIG) {
   startScoreboard();
-  ensureNeuralServer().catch((e) => console.warn("[Bot] Neural spawn error:", e));
+  ensureNeuralServer().catch((error) => {
+    recordDiagnosticEvent({
+      type: "neural_server_error",
+      severity: "warn",
+      bot: roleConfig.name,
+      message: error instanceof Error ? error.message : String(error),
+      details: error,
+    });
+    console.warn("[Bot] Neural spawn error:", error);
+  });
 
   // Load memory — register with executor so skill results go to this bot's file.
   const memStore = new BotMemoryStore(roleConfig.memoryFile);
@@ -88,8 +104,8 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     await new Promise((r) => setTimeout(r, 800));
 
     if (roleConfig.safeSpawn) {
-      const { x, z } = roleConfig.safeSpawn;
-      console.log(`[Bot] safeSpawn configured — teleporting to ${x},80,${z}`);
+      const { x, y, z } = roleConfig.safeSpawn;
+      console.log(`[Bot] Home base anchor is ${x},${y},${z}; ground-snapping nearby for safe spawn`);
       const preTpX = bot.entity.position.x;
       const preTpZ = bot.entity.position.z;
       // spreadplayers lands on the topmost safe block (no suffocation, no falls)
@@ -211,8 +227,8 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
 
   // In-game chat — ignore self. Other bots are heard ONLY when they address this
   // bot by name, and at most once per sender per cooldown window. This enables
-  // team coordination ("Mason! Craft a chest!") without runaway feedback loops.
-  const BOT_USERNAMES = new Set(["Atlas", "Flora", "Forge", "Mason", "Blade"]);
+  // team coordination ("Peter! Craft a chest!") without runaway feedback loops.
+  const BOT_USERNAMES = new Set(BOT_ROSTER.flatMap((role) => [role.name, role.username]));
   const BOT_CHAT_COOLDOWN_MS = 45_000;
   const lastBotChatHeard = new Map<string, number>();
   bot.on("chat", async (username, message) => {
@@ -291,9 +307,17 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     const cause = lastDeathMessage || "unknown";
     memStore.recordDeath(pos.x, pos.y, pos.z, cause);
     recordDeath(roleConfig.name);
+    recordDiagnosticEvent({
+      type: "bot_death",
+      severity: "warn",
+      bot: roleConfig.name,
+      message: cause,
+      details: { position: { x: pos.x, y: pos.y, z: pos.z } },
+    });
     console.log(`[Bot] I died! Cause: ${cause}. Respawning...`);
     lastDeathMessage = "";
     abortActiveSkill(bot);
+    void cancelActiveOperation(bot);
   });
 
   // Kicked
@@ -308,19 +332,33 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   });
 
   // Re-run spawn safety on every respawn
-  // Only the first bot (Atlas) sends gamerule commands to avoid disconnect.spam kicks
+  // Only the first bot sends gamerule commands to avoid disconnect.spam kicks.
   bot.on("spawn", async () => {
-    if (roleConfig.username === "Atlas") {
+    if (roleConfig.name === "Milo") {
       bot.chat("/gamerule keepInventory true");
       await new Promise((r) => setTimeout(r, 500));
       bot.chat("/gamerule doMobSpawning true");
       await new Promise((r) => setTimeout(r, 500));
     }
-    runSpawnSafety().catch((e) => console.warn("[Bot] Spawn safety error:", e));
+    runSpawnSafety().catch((error) => {
+      recordDiagnosticEvent({
+        type: "spawn_safety_error",
+        severity: "error",
+        bot: roleConfig.name,
+        message: error instanceof Error ? error.message : String(error),
+        details: error,
+      });
+      console.warn("[Bot] Spawn safety error:", error);
+    });
   });
 
   // One-time setup on first spawn
   bot.once("spawn", () => {
+    recordDiagnosticEvent({
+      type: "bot_spawned",
+      bot: roleConfig.name,
+      details: { username: roleConfig.username },
+    });
     console.log("[Bot] Spawned! Starting event-driven brain...");
 
     // Start browser viewer — use unified viewer if available, fall back to per-bot viewer
@@ -350,8 +388,15 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
       .then(() => {
         brain.start();
       })
-      .catch((e) => {
-        console.error("[Bot] Brain start failed:", e);
+      .catch((error) => {
+        recordDiagnosticEvent({
+          type: "brain_start_failed",
+          severity: "error",
+          bot: roleConfig.name,
+          message: error instanceof Error ? error.message : String(error),
+          details: error,
+        });
+        console.error("[Bot] Brain start failed:", error);
       });
   });
 

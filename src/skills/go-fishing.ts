@@ -1,14 +1,16 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
+import { safeGoto } from "../bot/navigation.js";
 
 const FISH_ATTEMPTS = 5;
 const BITE_TIMEOUT_MS = 35000;
 
-export const goFishingSkill: Skill = {
+export const goFishingSkill = defineSkill({
   name: "go_fishing",
   description:
     "Fish at nearby water for food and loot. Crafts a fishing rod if possible (needs 3 sticks + 2 string). Catches ~3-5 items.",
@@ -61,7 +63,7 @@ export const goFishingSkill: Skill = {
     // Navigate to water's edge (stand on the bank, not in the water)
     setMovements(bot);
     try {
-      await bot.pathfinder.goto(new goals.GoalNear(water.position.x, water.position.y + 1, water.position.z, 3));
+      await safeGoto(bot, new goals.GoalNear(water.position.x, water.position.y + 1, water.position.z, 3), 20_000);
     } catch {
       /* try anyway */
     }
@@ -123,7 +125,7 @@ export const goFishingSkill: Skill = {
       stats: { fishCaught: caught },
     };
   },
-};
+});
 
 /** Wait for the fishing bobber to dip, indicating a bite. */
 async function waitForBite(bot: Bot, signal: AbortSignal, timeoutMs: number): Promise<boolean> {
@@ -250,7 +252,7 @@ async function craftFishingRod(bot: Bot, signal: AbortSignal): Promise<void> {
   if (table) {
     setMovements(bot);
     try {
-      await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+      await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
     } catch {
       /* best-effort */
     }

@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 
 const MAX_BRIDGE_LENGTH = 30;
@@ -20,7 +21,7 @@ const BRIDGE_BLOCKS = [
   "mangrove_planks",
 ];
 
-export const buildBridgeSkill: Skill = {
+export const buildBridgeSkill = defineSkill({
   name: "build_bridge",
   description:
     "Build a bridge across water or a gap in the direction you're facing. Uses cobblestone or planks from inventory. Max 30 blocks.",
@@ -141,7 +142,7 @@ export const buildBridgeSkill: Skill = {
       stats: { blocksPlaced: placed },
     };
   },
-};
+});
 
 function isSolid(name: string): boolean {
   return name !== "air" && name !== "water" && name !== "lava" && name !== "short_grass" && name !== "tall_grass";

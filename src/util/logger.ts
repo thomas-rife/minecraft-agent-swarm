@@ -10,6 +10,8 @@
  * Shortcut: DEBUG=1 or DEBUG=true is equivalent to LOG_LEVEL=debug.
  */
 
+import { recordDiagnosticEvent } from "./diagnostic-log.js";
+
 type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -109,10 +111,26 @@ export function createLogger(botName?: string): Logger {
       console.log(formatPrefix("info", tag, botName), message, ...args);
     },
     warn(tag: string, message: string, ...args: unknown[]) {
+      recordDiagnosticEvent({
+        type: "warning",
+        severity: "warn",
+        bot: botName,
+        code: tag,
+        message,
+        details: args.length ? args : undefined,
+      });
       if (!shouldLog("warn")) return;
       console.warn(formatPrefix("warn", tag, botName), message, ...args);
     },
     error(tag: string, message: string, ...args: unknown[]) {
+      recordDiagnosticEvent({
+        type: "error",
+        severity: "error",
+        bot: botName,
+        code: tag,
+        message,
+        details: args.length ? args : undefined,
+      });
       if (!shouldLog("error")) return;
       console.error(formatPrefix("error", tag, botName), message, ...args);
     },

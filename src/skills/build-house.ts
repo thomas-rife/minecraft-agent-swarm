@@ -1,5 +1,5 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillProgress, SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { houseBlueprint } from "./blueprints/house.js";
 import { LOG_TYPES, PLANK_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
 import { Vec3 } from "vec3";
@@ -8,7 +8,9 @@ const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { hasStructureNearby, addStructure, getNearestStructure } from "../bot/memory.js";
 import { getBotMemoryStore, getAllMemoryStores } from "../bot/memory-registry.js";
-import { collectNearbyDrops } from "../bot/navigation.js";
+import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
+import { operationResult, succeeded } from "../operations/types.js";
+import { upsertSharedStructure } from "../world/registry.js";
 
 /** All door types — any wood's door works interchangeably */
 const DOOR_TYPES = [
@@ -25,7 +27,7 @@ const DOOR_TYPES = [
 /** Remember last build site so repeated build_house calls finish the same house */
 let lastBuildSite: Vec3 | null = null;
 
-export const buildHouseSkill: Skill = {
+export const buildHouseSkill = defineSkill({
   name: "build_house",
   description:
     "Build a 7x7 house with walls, roof, door, crafting table, and torches. Works with ANY wood type. Gathers materials automatically. Takes ~2 minutes.",
@@ -38,7 +40,7 @@ export const buildHouseSkill: Skill = {
     return {};
   },
 
-  async execute(bot, params, signal, onProgress): Promise<SkillResult> {
+  async execute(bot, params, signal, onProgress) {
     const bp = houseBlueprint;
 
     // --- Step 1: Find a flat build site ---
@@ -159,7 +161,7 @@ export const buildHouseSkill: Skill = {
         try {
           setMovements(bot);
           await Promise.race([
-            bot.pathfinder.goto(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2)),
+            safeGoto(bot, new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2), 15_000),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error("pathfinder timeout")), 15_000)),
           ]);
           await bot.dig(block);
@@ -288,7 +290,7 @@ export const buildHouseSkill: Skill = {
         const dist = bot.entity.position.distanceTo(worldPos);
         if (dist > 4.5) {
           setMovements(bot);
-          await bot.pathfinder.goto(new goals.GoalNear(worldPos.x, worldPos.y, worldPos.z, 3));
+          await safeGoto(bot, new goals.GoalNear(worldPos.x, worldPos.y, worldPos.z, 3), 15_000);
         }
 
         await bot.equip(item, "hand");
@@ -353,38 +355,79 @@ export const buildHouseSkill: Skill = {
     );
     try {
       setMovements(bot);
-      await bot.pathfinder.goto(new goals.GoalNear(entrancePos.x, entrancePos.y, entrancePos.z, 1));
+      await safeGoto(bot, new goals.GoalNear(entrancePos.x, entrancePos.y, entrancePos.z, 1), 15_000);
     } catch {
       /* ok */
     }
 
-    if (placed > total * 0.7) {
+    const postconditions = verifyHouseBlueprint(bot, origin, bp);
+    const houseVerified = postconditions.every((condition) => condition.satisfied);
+    if (placed > total * 0.7 && houseVerified) {
       // Save house to per-bot memory (falls back to singleton if no per-bot store registered)
       const _ms = getBotMemoryStore(bot);
       if (_ms) _ms.addStructure("house", origin.x, origin.y, origin.z, bp.name);
       else addStructure("house", origin.x, origin.y, origin.z, bp.name);
-      return {
-        success: true,
-        message: `HOUSE BUILT! "${bp.name}" at ${origin.x}, ${origin.y}, ${origin.z}. Placed ${placed} blocks (${skipped} skipped). It's GORGEOUS. It's HOME.`,
-        stats: { blocksPlaced: placed, blocksSkipped: skipped },
-      };
+      upsertSharedStructure({
+        id: `house-${origin.x}-${origin.z}`,
+        type: "house",
+        status: "verified",
+        position: { x: origin.x, y: origin.y, z: origin.z },
+        provenance: "skill",
+        verifiedAt: Date.now(),
+        evidence: { placed, skipped, blueprint: bp.name },
+      });
+      return succeeded(
+        "HOUSE_VERIFIED",
+        `HOUSE BUILT! "${bp.name}" at ${origin.x}, ${origin.y}, ${origin.z}. Placed ${placed} blocks (${skipped} skipped).`,
+        { progress: { blocksPlaced: placed, blocksSkipped: skipped }, postconditions },
+      );
     } else if (placed > 0) {
       // Save house to per-bot memory (even if partial)
       const _ms = getBotMemoryStore(bot);
       if (_ms) _ms.addStructure("house", origin.x, origin.y, origin.z, `${bp.name} (partial)`);
       else addStructure("house", origin.x, origin.y, origin.z, `${bp.name} (partial)`);
-      return {
-        success: true,
-        message: `House partially built (${placed}/${total} blocks). It has... character. Maybe patch the holes later.`,
-        stats: { blocksPlaced: placed, blocksSkipped: skipped },
-      };
+      upsertSharedStructure({
+        id: `house-${origin.x}-${origin.z}`,
+        type: "house",
+        status: "building",
+        position: { x: origin.x, y: origin.y, z: origin.z },
+        provenance: "skill",
+        evidence: {
+          placed,
+          skipped,
+          blueprint: bp.name,
+          missingComponents: postconditions.filter((condition) => !condition.satisfied).map((condition) => condition.name),
+        },
+      });
+      return operationResult("partial", "HOUSE_INCOMPLETE", `House partially built (${placed}/${total} blocks).`, {
+        retryable: true,
+        worldChanged: true,
+        progress: { blocksPlaced: placed, blocksSkipped: skipped },
+        postconditions,
+      });
     }
     return {
       success: false,
       message: "Couldn't place any blocks. Terrain problems or empty inventory.",
     };
   },
-};
+});
+
+function verifyHouseBlueprint(bot: Bot, origin: Vec3, blueprint: typeof houseBlueprint) {
+  const structureBlocks = blueprint.blocks.filter((block) => block.phase === "structure");
+  const occupied = structureBlocks.filter((block) => {
+    const position = origin.offset(block.pos[0], block.pos[1], block.pos[2]);
+    const actual = bot.blockAt(position)?.name;
+    return actual !== undefined && actual !== "air" && actual !== "cave_air";
+  }).length;
+  const shellRatio = structureBlocks.length > 0 ? occupied / structureBlocks.length : 0;
+  const entrance = origin.offset(blueprint.entrance.pos[0], blueprint.entrance.pos[1], blueprint.entrance.pos[2]);
+  const doorPresent = DOOR_TYPES.includes(bot.blockAt(entrance)?.name as (typeof DOOR_TYPES)[number]);
+  return [
+    { name: "house_shell_complete", satisfied: shellRatio >= 0.85, evidence: { occupied, total: structureBlocks.length, shellRatio } },
+    { name: "house_entrance_present", satisfied: doorPresent, evidence: { entrance, actual: bot.blockAt(entrance)?.name ?? null } },
+  ];
+}
 
 // --- Helpers ---
 
@@ -645,7 +688,7 @@ async function craftDoors(bot: Bot, count: number, signal: AbortSignal): Promise
   // Navigate to table
   try {
     setMovements(bot);
-    await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+    await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
   } catch {
     /* try anyway */
   }
@@ -692,7 +735,7 @@ async function craftSome(bot: Bot, itemName: string, count: number, signal: Abor
     if (table) {
       try {
         setMovements(bot);
-        await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+        await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
       } catch {
         /* try anyway */
       }

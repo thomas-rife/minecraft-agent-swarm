@@ -10,8 +10,6 @@
  */
 
 import { getSkillPromptLines } from "../skills/registry.js";
-import { getDynamicSkillNames } from "../skills/dynamic-loader.js";
-import { rankSkills, annotateSkill } from "../skills/reliability.js";
 
 export interface RoleContext {
   name: string;
@@ -45,7 +43,7 @@ const ACTION_SIGNATURES: Record<string, string> = {
   invoke_skill: 'invoke_skill {"skill":"exact_skill_name"}',
   generate_skill: 'generate_skill {"task":"description"}',
   neural_combat: 'neural_combat {"duration":5}',
-  give_item: 'give_item {"to":"Flora","item":"oak_log","count":8}',
+  give_item: 'give_item {"to":"Ava","item":"oak_log","count":8}',
   deposit_stash: "deposit_stash {}",
   withdraw_stash: 'withdraw_stash {"item":"oak_log","count":8}',
 };
@@ -66,25 +64,25 @@ export function buildStrategicPrompt(role: RoleContext): string {
     "give_item",
     "deposit_stash",
     "withdraw_stash",
-  ];
+  ].filter((name) => name !== "invoke_skill" || role.allowedSkills === undefined || role.allowedSkills.length > 0);
+  const strategicCapabilities = new Set([
+    "explore",
+    "idle",
+    "respond_to_chat",
+    "invoke_skill",
+    "deposit_stash",
+    "withdraw_stash",
+  ]);
   const actions = role.allowedActions?.length
-    ? renderActions([...role.allowedActions, ...universalNames.filter((u) => !role.allowedActions!.includes(u))])
-    : renderActions(Object.keys(ACTION_SIGNATURES));
+    ? renderActions(
+        [...role.allowedActions, ...universalNames.filter((u) => !role.allowedActions!.includes(u))].filter((name) =>
+          strategicCapabilities.has(name),
+        ),
+      )
+    : renderActions(universalNames.filter((name) => strategicCapabilities.has(name)));
 
   // Skills list
-  const builtinSkills = role.allowedSkills?.length ? role.allowedSkills.join(", ") : "";
-  const skillLines = !role.allowedSkills?.length ? getSkillPromptLines() : "";
-
-  // Ranked by team-wide success rate: proven first, untried next (exploration),
-  // strugglers last, retired skills excluded entirely.
-  const dynamicSkills = rankSkills(getDynamicSkillNames());
-  const dynamicLine =
-    dynamicSkills.length > 0
-      ? `\nDynamic skills (use invoke_skill; % = team success rate): ${dynamicSkills
-          .slice(0, 10)
-          .map(annotateSkill)
-          .join(", ")}${dynamicSkills.length > 10 ? ` (+${dynamicSkills.length - 10} more)` : ""}`
-      : "";
+  const skillLines = getSkillPromptLines(role.allowedSkills);
 
   const missionLine = role.seasonGoal
     ? `🎯 MISSION: ${role.seasonGoal}\nEvery decision should advance this mission.\n\n`
@@ -94,8 +92,8 @@ export function buildStrategicPrompt(role: RoleContext): string {
 ${role.personality}
 
 ${role.role ? `ROLE: ${role.role}\n` : ""}ACTIONS: ${actions}
-${builtinSkills ? `SKILLS: ${builtinSkills}` : ""}
-${skillLines}${dynamicLine}
+HIGH-LEVEL SKILL CONTRACTS:
+${skillLines || "(none available)"}
 
 ${role.priorities || ""}
 
@@ -105,20 +103,6 @@ CRAFTING BASICS:
 - Wool from killing sheep (0-2 per sheep). 3 wool + 3 planks → bed.
 - Use exact Minecraft IDs: oak_planks, stick, wooden_pickaxe, etc.
 
-IRON PATH (the goal — don't mine plain stone when you want iron):
-- When you SPOT iron_ore, mine it: mine_block {"blockType":"iron_ore"} (it walks
-  to the ore and mines the whole vein). A stone pickaxe or better is required.
-- Then smelt it: invoke_skill {"skill":"smelt_ores"} → iron_ingot (needs a
-  furnace + fuel like coal/planks; the skill builds the furnace from cobblestone).
-- Then upgrade gear: invoke_skill {"skill":"craft_gear"}.
-- No ore in sight? invoke_skill {"skill":"strip_mine"} digs down to Y=11 and mines.
-
-FOOD / DON'T STARVE:
-- If hunger is low: eat {} (eats the best food you have, including raw meat).
-- NO food in inventory? attack {} — when no monster is near it HUNTS the nearest
-  animal (cow/pig/sheep/chicken) and collects the meat. Then eat {}. Hunt BEFORE
-  you starve, not at 0 hunger.
-
 RULES:
 - Respond ONLY with valid JSON. Keep "thought" under 120 chars — shown on stream.
 - Be entertaining and in-character in your "thought" wording — BUT base every
@@ -127,7 +111,7 @@ RULES:
   never the facts: if the state says daytime and no threats, you are safe.
 - READ your inventory before choosing. Don't craft without materials.
 - If an action failed recently, try something COMPLETELY DIFFERENT.
-- FOCUS: Finish one goal before starting another. Plan 3-5 steps ahead.
+- FOCUS: Finish one objective before starting another. Completion is checked from world state.
 - PREFER SKILLS over manual actions when available.
 - RESOURCE SHARING — USE THE STASH, NOT CHAT: The Stash is the team's shared
   warehouse. If you NEED an item, withdraw_stash it. If you have SURPLUS,
@@ -136,7 +120,7 @@ RULES:
   withdraw. give_item is only for emergencies when the stash is empty.
 
 RESPONSE FORMAT:
-{"thought":"Brief entertaining narration","action":"action_name","params":{...},"goal":"Current objective","goalSteps":5}
+{"thought":"Brief entertaining narration","action":"action_name","params":{...},"goal":"Current objective"}
 
 Set "goal" when starting something new. Omit when continuing.
 `;

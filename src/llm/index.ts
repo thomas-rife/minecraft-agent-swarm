@@ -33,6 +33,22 @@ function samplingFor(model: string, temperature: number) {
 
 const ollama = new Ollama({ host: config.ollama.host });
 const llmLog = createLogger();
+const LLM_TIMEOUT_MS = 45_000;
+
+async function chatTimed(label: string, request: Parameters<Ollama["chat"]>[0], timeoutMs = LLM_TIMEOUT_MS): Promise<any> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      ollama.chat(request),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface LLMTool {
   name: string;
@@ -247,7 +263,7 @@ export async function queryStrategic(
 
   try {
     const startedAt = Date.now();
-    const response = await ollama.chat({
+    const response = await chatTimed("strategic", {
       model: config.ollama.model, // Strong model for strategic decisions
       messages,
       think: thinkFor(config.ollama.model),
@@ -292,7 +308,7 @@ export async function queryReactive(
 
   try {
     const startedAt = Date.now();
-    const response = await ollama.chat({
+    const response = await chatTimed("reactive", {
       model: config.ollama.fastModel,
       messages,
       think: thinkFor(config.ollama.fastModel),
@@ -339,7 +355,7 @@ export async function queryCritic(
   ];
 
   try {
-    const response = await ollama.chat({
+    const response = await chatTimed("critic", {
       model: config.ollama.fastModel,
       messages,
       think: thinkFor(config.ollama.fastModel),
@@ -501,7 +517,7 @@ export async function queryLLM(
 
   try {
     const startedAt = Date.now();
-    let response = await ollama.chat({
+    let response = await chatTimed("legacy_decide", {
       model: config.ollama.fastModel,
       messages,
       think: thinkFor(config.ollama.fastModel),
@@ -517,7 +533,7 @@ export async function queryLLM(
     // Retry once on short/empty response
     if (response.message.content.trim().length < 20) {
       llmLog.warn("LLM", "Short/empty response — retrying with fallback prompt...");
-      response = await ollama.chat({
+      response = await chatTimed("legacy_retry", {
         model: config.ollama.fastModel,
         think: thinkFor(config.ollama.fastModel),
         messages: [
@@ -553,7 +569,7 @@ export async function queryLLM(
 
 export async function chatWithLLM(prompt: string, context: string, roleConfig?: { name: string }): Promise<string> {
   try {
-    const response = await ollama.chat({
+    const response = await chatTimed("chat", {
       model: config.ollama.fastModel,
       // think:false is load-bearing: without it qwen3.6 spends the entire
       // token budget inside <think> and returns empty content ("Hmm...").

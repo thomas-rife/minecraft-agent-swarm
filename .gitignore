@@ -4,6 +4,7 @@ dist/
 server/
 *.jar
 logs/
+data/
 memory.json
 firebase-debug.log
 

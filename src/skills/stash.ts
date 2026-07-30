@@ -3,10 +3,47 @@
 
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
-import { snapshotChest } from "./stash-ledger.js";
+import { recordStashTransaction, snapshotChest } from "./stash-ledger.js";
 import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
-import { safeGoto } from "../bot/actions.js";
+import { safeGoto } from "../bot/navigation.js";
+
+const stashLocks = new Map<string, Promise<void>>();
+
+export async function withStashLock<T>(stashPos: { x: number; y: number; z: number }, work: () => Promise<T>): Promise<T> {
+  const key = `${Math.floor(stashPos.x)},${Math.floor(stashPos.y)},${Math.floor(stashPos.z)}`;
+  const previous = stashLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const queued = previous.then(() => gate);
+  stashLocks.set(key, queued);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (stashLocks.get(key) === queued) stashLocks.delete(key);
+  }
+}
+
+function inventoryCounts(bot: Bot): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of bot.inventory.items()) counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+  return counts;
+}
+
+function itemCounts(items: Array<{ name: string; count: number }>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+  return counts;
+}
+
+function addContainerDeltas(target: Map<string, number>, before: Map<string, number>, after: Map<string, number>): void {
+  for (const name of new Set([...before.keys(), ...after.keys()])) {
+    const delta = (after.get(name) ?? 0) - (before.get(name) ?? 0);
+    if (delta !== 0) target.set(name, (target.get(name) ?? 0) + delta);
+  }
+}
 
 /** bot.openContainer with a hard timeout — a chest GUI that never opens (block
  *  not truly reachable/loaded) otherwise blocks forever, hanging the calling
@@ -261,6 +298,44 @@ export async function depositStash(
   stashPos: { x: number; y: number; z: number },
   keepItems: { name: string; minCount: number }[],
 ): Promise<string> {
+  return withStashLock(stashPos, () => depositStashUnlocked(bot, stashPos, keepItems));
+}
+
+async function depositStashUnlocked(
+  bot: Bot,
+  stashPos: { x: number; y: number; z: number },
+  keepItems: { name: string; minCount: number }[],
+): Promise<string> {
+  const beforeInventory = inventoryCounts(bot);
+  const containerDeltas = new Map<string, number>();
+  const finishDeposit = (message: string): string => {
+    const after = inventoryCounts(bot);
+    let recorded = 0;
+    for (const [item, before] of beforeInventory) {
+      const delta = before - (after.get(item) ?? 0);
+      if (delta <= 0) continue;
+      recordStashTransaction({
+        bot: bot.username,
+        kind: "deposit",
+        item,
+        requested: delta,
+        verifiedDelta: -delta,
+        containerDelta: containerDeltas.get(item) ?? 0,
+      });
+      recorded += delta;
+    }
+    if (recorded === 0) {
+      recordStashTransaction({
+        bot: bot.username,
+        kind: "deposit",
+        item: "*",
+        requested: [...beforeInventory.values()].reduce((total, count) => total + count, 0),
+        verifiedDelta: 0,
+        containerDelta: 0,
+      });
+    }
+    return message;
+  };
   // Walk to stash area
   await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
 
@@ -272,7 +347,7 @@ export async function depositStash(
   // caused 16 deposit_stash hangs in 9 min when the team was stuck underground.
   const distToStash = bot.entity.position.distanceTo(new Vec3(stashPos.x, stashPos.y, stashPos.z));
   if (distToStash > 6) {
-    return `Can't reach the stash — ${distToStash.toFixed(0)} blocks away (blocked or underground). Get to the surface near ${stashPos.x},${stashPos.y},${stashPos.z} first.`;
+    return finishDeposit(`Can't reach the stash — ${distToStash.toFixed(0)} blocks away (blocked or underground). Get to the surface near ${stashPos.x},${stashPos.y},${stashPos.z} first.`);
   }
 
   const itemsToDeposit = bot.inventory.items();
@@ -317,6 +392,7 @@ export async function depositStash(
       // Use fallback chest
       try {
         const container = await openContainerTimed(bot, fallback);
+        const chestBefore = itemCounts(container.containerItems());
         for (const item of items) {
           try {
             await container.deposit(item.type, null, item.count);
@@ -325,6 +401,8 @@ export async function depositStash(
             // Chest might be full
           }
         }
+        const chestAfter = itemCounts(container.containerItems());
+        addContainerDeltas(containerDeltas, chestBefore, chestAfter);
         snapshotChest(fallback.position, container.containerItems(), container.inventoryStart);
         container.close();
       } catch {
@@ -336,6 +414,7 @@ export async function depositStash(
     try {
       await safeGoto(bot, new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2), 10000);
       const container = await openContainerTimed(bot, chest);
+      const chestBefore = itemCounts(container.containerItems());
       for (const item of items) {
         try {
           await container.deposit(item.type, null, item.count);
@@ -344,6 +423,8 @@ export async function depositStash(
           // Chest full — this will trigger expansion request
         }
       }
+      const chestAfter = itemCounts(container.containerItems());
+      addContainerDeltas(containerDeltas, chestBefore, chestAfter);
       snapshotChest(chest.position, container.containerItems(), container.inventoryStart);
       container.close();
     } catch {
@@ -396,6 +477,7 @@ export async function depositStash(
         const placed = await placeChestNearStash(bot, stashPos);
         if (placed) {
           const container = await openContainerTimed(bot, placed);
+          const chestBefore = itemCounts(container.containerItems());
           for (const item of bot.inventory.items()) {
             if (item.name === "chest") continue; // keep spare chests for next expansion
             if (shouldKeep(item.name, keepItems, keptCounts)) continue;
@@ -406,6 +488,8 @@ export async function depositStash(
               break; // new chest full too
             }
           }
+          const chestAfter = itemCounts(container.containerItems());
+          addContainerDeltas(containerDeltas, chestBefore, chestAfter);
           snapshotChest(placed.position, container.containerItems(), container.inventoryStart);
           container.close();
           noChest = 0;
@@ -432,7 +516,7 @@ export async function depositStash(
     for (const f of ["bread", "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod"]) {
       if (Date.now() - topupStart > 20000) break;
       try {
-        await withdrawStash(bot, stashPos, f, 4 - foodHeld);
+        await withdrawStashUnlocked(bot, stashPos, f, 4 - foodHeld);
       } catch {
         /* none of this food in stash — try next */
       }
@@ -441,18 +525,27 @@ export async function depositStash(
   }
 
   if (noChest > 0 && deposited === 0) {
-    return "All stash chests are full! Need more chests.";
+    return finishDeposit("All stash chests are full! Need more chests.");
   }
   if (noChest > 0) {
-    return `Deposited ${deposited} items. ${noChest} items couldn't fit — stash needs expansion.`;
+    return finishDeposit(`Deposited ${deposited} items. ${noChest} items couldn't fit — stash needs expansion.`);
   }
-  return `Deposited ${deposited} items at the stash.`;
+  return finishDeposit(`Deposited ${deposited} items at the stash.`);
 }
 
 /**
  * Walk to stash, find item in categorized chests, withdraw specified count.
  */
 export async function withdrawStash(
+  bot: Bot,
+  stashPos: { x: number; y: number; z: number },
+  itemName: string,
+  count: number,
+): Promise<string> {
+  return withStashLock(stashPos, () => withdrawStashUnlocked(bot, stashPos, itemName, count));
+}
+
+async function withdrawStashUnlocked(
   bot: Bot,
   stashPos: { x: number; y: number; z: number },
   itemName: string,
@@ -502,6 +595,7 @@ export async function withdrawStash(
       .filter((i) => i.name.includes(matchName))
       .reduce((s, i) => s + i.count, 0);
   const before = countItem();
+  let containerDelta = 0;
 
   let withdrawn = 0;
   const needed = count;
@@ -511,6 +605,9 @@ export async function withdrawStash(
     try {
       await safeGoto(bot, new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2), 10000);
       const container = await openContainerTimed(bot, chest);
+      const chestBefore = container.containerItems()
+        .filter((item) => item.name.includes(matchName))
+        .reduce((total, item) => total + item.count, 0);
 
       for (const slot of container.containerItems()) {
         if (withdrawn >= needed) break;
@@ -524,6 +621,10 @@ export async function withdrawStash(
           }
         }
       }
+      const chestAfter = container.containerItems()
+        .filter((item) => item.name.includes(matchName))
+        .reduce((total, item) => total + item.count, 0);
+      containerDelta += chestAfter - chestBefore;
       snapshotChest(chest.position, container.containerItems(), container.inventoryStart);
       container.close();
     } catch {
@@ -533,12 +634,23 @@ export async function withdrawStash(
 
   // Report the VERIFIED delta, not what container.withdraw claimed.
   const gained = countItem() - before;
+  const finishWithdraw = (message: string): string => {
+    recordStashTransaction({
+      bot: bot.username,
+      kind: "withdraw",
+      item: itemName,
+      requested: needed,
+      verifiedDelta: gained,
+      containerDelta,
+    });
+    return message;
+  };
   if (gained <= 0 && withdrawn > 0) {
-    return `Tried to withdraw ${itemName} but it never reached your inventory (stash transfer failed) — the stash may be empty of it. Gather it yourself or check a different item.`;
+    return finishWithdraw(`Tried to withdraw ${itemName} but it never reached your inventory (stash transfer failed) — the stash may be empty of it. Gather it yourself or check a different item.`);
   }
-  if (gained === 0) return `No ${itemName} in the stash. Gather it yourself instead.`;
-  if (gained < needed) return `Withdrew ${gained}x ${itemName} from stash (wanted ${needed} — that's all there was).`;
-  return `Withdrew ${gained}x ${itemName} from stash.`;
+  if (gained === 0) return finishWithdraw(`No ${itemName} in the stash. Gather it yourself instead.`);
+  if (gained < needed) return finishWithdraw(`Withdrew ${gained}x ${itemName} from stash (wanted ${needed} — that's all there was).`);
+  return finishWithdraw(`Withdrew ${gained}x ${itemName} from stash.`);
 }
 
 /** Find open ground just past the stash rows and place a chest from inventory.

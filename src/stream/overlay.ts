@@ -42,7 +42,7 @@ const defaultState = (): OverlayState => ({
 const instances = new Map<string, OverlayInstance>();
 
 /** Start an overlay server for a single bot. Returns per-bot functions. */
-export function startOverlay(port = 3001, botName = "Atlas"): OverlayInstance {
+export function startOverlay(port = 3001, botName = "Milo"): OverlayInstance {
   let io: SocketIO | null = null;
   let state: OverlayState = defaultState();
 
@@ -99,7 +99,7 @@ export function getOverlay(botName: string): OverlayInstance | undefined {
 // bot/index.ts calls these with no bot-name context.
 // We keep a "current" pointer that gets set per-bot before the decision loop runs.
 
-let currentBotName = "Atlas";
+let currentBotName = "Milo";
 
 export function setCurrentBot(name: string) {
   currentBotName = name;

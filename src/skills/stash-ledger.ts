@@ -7,6 +7,8 @@
  * hardcoded "--" stub) reads the aggregate from here.
  */
 
+import { defaultStateFile, loadJsonFile, saveJsonFile } from "../persistence/json-store.js";
+
 export interface ChestSnapshot {
   /** "x,y,z" */
   pos: string;
@@ -17,6 +19,67 @@ export interface ChestSnapshot {
 }
 
 const chests = new Map<string, ChestSnapshot>();
+
+export interface StashTransaction {
+  id: string;
+  bot: string;
+  kind: "deposit" | "withdraw";
+  item: string;
+  requested: number;
+  /** Signed bot inventory change: negative deposit, positive withdrawal. */
+  verifiedDelta: number;
+  /** Signed canonical container change: positive deposit, negative withdrawal. */
+  containerDelta: number;
+  status: "committed" | "partial" | "failed";
+  timestamp: number;
+}
+
+const transactions: StashTransaction[] = [];
+let persistenceFile: string | null = null;
+
+interface PersistedStashLedger {
+  chests: ChestSnapshot[];
+  transactions: StashTransaction[];
+}
+
+export function configureStashLedgerPersistence(file = defaultStateFile("stash-ledger.json")): void {
+  if (persistenceFile) return;
+  persistenceFile = file;
+  const stored = loadJsonFile<PersistedStashLedger>(file, { chests: [], transactions: [] });
+  for (const chest of stored.chests) chests.set(chest.pos, chest);
+  transactions.push(...stored.transactions.slice(-500));
+}
+
+function persistLedger(): void {
+  if (!persistenceFile) return;
+  saveJsonFile(persistenceFile, { chests: [...chests.values()], transactions: transactions.slice(-500) });
+}
+
+export function recordStashTransaction(transaction: Omit<StashTransaction, "id" | "timestamp" | "status">): StashTransaction {
+  const timestamp = Date.now();
+  const absolute = Math.abs(transaction.verifiedDelta);
+  const bothSidesVerified =
+    transaction.kind === "deposit"
+      ? transaction.verifiedDelta < 0 && transaction.containerDelta > 0
+      : transaction.verifiedDelta > 0 && transaction.containerDelta < 0;
+  const containerAbsolute = Math.abs(transaction.containerDelta);
+  const verified = Math.min(absolute, containerAbsolute);
+  const status = !bothSidesVerified || verified <= 0 ? "failed" : verified < transaction.requested ? "partial" : "committed";
+  const recorded: StashTransaction = {
+    ...transaction,
+    id: `stash-${timestamp.toString(36)}-${transactions.length.toString(36)}`,
+    timestamp,
+    status,
+  };
+  transactions.push(recorded);
+  if (transactions.length > 500) transactions.splice(0, transactions.length - 500);
+  persistLedger();
+  return recorded;
+}
+
+export function getStashTransactions(): StashTransaction[] {
+  return [...transactions];
+}
 
 const CATEGORY_MATCHERS: { key: string; match: (n: string) => boolean }[] = [
   {
@@ -75,6 +138,7 @@ export function snapshotChest(
     totalSlots,
     updatedAt: Date.now(),
   });
+  persistLedger();
 }
 
 export interface StashSummary {

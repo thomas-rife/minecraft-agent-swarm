@@ -1,20 +1,19 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillProgress, SkillResult } from "./types.js";
+import type { Skill, SkillProgress } from "./types.js";
 import { gatherMaterials } from "./materials.js";
 import { updateOverlay } from "../stream/overlay.js";
 import { recordSkillAttempt } from "../bot/memory.js";
 import { getBotMemoryStore, registerBotMemory } from "../bot/memory-registry.js";
+import { cancelActiveOperation, runControlledOperation } from "../operations/controller.js";
+import { failed, operationResult, type OperationResult } from "../operations/types.js";
 
 export { registerBotMemory };
 
 type ActiveSkillState = {
   skill: Skill;
-  abortController: AbortController;
-  promise: Promise<SkillResult>;
   startTime: number;
 };
 
-// Per-bot skill state — keyed by bot instance so multiple bots don't interfere.
 const activeSkillMap = new Map<Bot, ActiveSkillState>();
 
 export function isSkillRunning(bot: Bot): boolean {
@@ -29,171 +28,151 @@ export function abortActiveSkill(bot: Bot): void {
   const active = activeSkillMap.get(bot);
   if (active) {
     console.log(`[Skill] Aborting skill "${active.skill.name}"`);
-    active.abortController.abort();
+    void cancelActiveOperation(bot);
   }
 }
 
-/**
- * Run a skill to completion: gather materials → execute → return result string.
- * Called from executeAction() when the LLM picks a skill action.
- */
-export async function runSkill(bot: Bot, skill: Skill, params: Record<string, any>): Promise<string> {
+/** Run a deterministic skill under the bot's single cancellable operation controller. */
+export async function runSkill(bot: Bot, skill: Skill, params: Record<string, any>): Promise<OperationResult> {
   const active = activeSkillMap.get(bot);
   if (active) {
-    return `Already running skill "${active.skill.name}". Wait for it to finish.`;
+    return failed("SKILL_ALREADY_ACTIVE", `Already running skill "${active.skill.name}".`, {
+      retryable: true,
+      observations: { activeSkill: active.skill.name },
+    });
   }
 
-  const abortController = new AbortController();
-  const { signal } = abortController;
   const startTime = Date.now();
-
+  activeSkillMap.set(bot, { skill, startTime });
   console.log(`[Skill] Starting "${skill.name}"`);
 
-  const progress = (p: SkillProgress) => {
-    updateOverlay({ skillProgress: p });
-    if (p.message) {
-      console.log(`[Skill] ${skill.name}: ${p.phase} — ${p.message} (${Math.round(p.progress * 100)}%)`);
+  const progress = (value: SkillProgress) => {
+    updateOverlay({ skillProgress: value });
+    if (value.message) {
+      console.log(`[Skill] ${skill.name}: ${value.phase} - ${value.message} (${Math.round(value.progress * 100)}%)`);
     }
   };
 
-  // Phase 1: Gather materials
-  progress({
-    skillName: skill.name,
-    phase: "Checking materials",
-    progress: 0,
-    message: "Scanning inventory...",
-    active: true,
-  });
-
-  const materialsNeeded = skill.estimateMaterials(bot, params);
-  const materialsList = Object.entries(materialsNeeded);
-
-  if (materialsList.length > 0) {
-    const summary = materialsList.map(([k, v]) => `${v}x ${k}`).join(", ");
-    console.log(`[Skill] Materials needed: ${summary}`);
-
-    try {
-      const gatherResult = await gatherMaterials(bot, materialsNeeded, signal, (msg, pct) => {
-        progress({
-          skillName: skill.name,
-          phase: "Gathering materials",
-          progress: pct * 0.3,
-          message: msg,
-          active: true,
-        });
-      });
-
-      if (!gatherResult.success) {
-        progress({ skillName: skill.name, phase: "Failed", progress: 0, message: gatherResult.message, active: false });
-        return `Skill ${skill.name} failed: ${gatherResult.message}`;
-      }
-    } catch (err: any) {
-      progress({ skillName: skill.name, phase: "Failed", progress: 0, message: err.message, active: false });
-      return `Skill ${skill.name} crashed during gathering: ${err.message}`;
-    }
-  }
-
-  if (signal.aborted) {
-    progress({ skillName: skill.name, phase: "Aborted", progress: 0, message: "Interrupted!", active: false });
-    return `Skill ${skill.name} was interrupted.`;
-  }
-
-  // Phase 2: Execute the skill
-  const skillPromise = skill.execute(bot, params, signal, (p) => {
-    progress({
-      ...p,
-      progress: 0.3 + p.progress * 0.7, // Remap: gathering = 0-30%, execution = 30-100%
-    });
-  });
-
-  activeSkillMap.set(bot, { skill, abortController, promise: skillPromise, startTime });
-
-  // Skill chatter — bot narrates every 30s so the stream isn't dead air during long skills
-  const SKILL_QUIPS = [
+  const quips = [
     "Still working on it... this better be worth it.",
-    "Don't rush me, I'm an AI. Time is relative.",
     "Going great. Totally under control.",
-    "This is fine. Everything is fine.",
     "Almost there... maybe.",
-    "I have no idea how long this will take.",
     "Chat, if this works, you owe me a follow.",
-    "My hands are a blur right now. Well, I don't have hands. You know what I mean.",
-    "The process is the journey. Or something. I don't know, I'm busy.",
   ];
   const chatterInterval = setInterval(() => {
-    if (activeSkillMap.has(bot)) {
-      const quip = SKILL_QUIPS[Math.floor(Math.random() * SKILL_QUIPS.length)];
-      bot.chat(quip);
-    }
-  }, 30000);
-
-  // HARD WATCHDOG: a skill that blocks in an unbounded call (e.g. a
-  // pathfinder.goto to an unreachable goal, or bot.dig on a stuck block) never
-  // observes the abort signal, so it freezes the bot's ENTIRE brain loop
-  // indefinitely. Atlas + Flora were frozen ~13h inside a hung strip_mine.
-  // Race the skill against a hard timeout that force-stops movement and RETURNS,
-  // freeing the brain regardless of what the skill's internal await is doing.
-  const MAX_SKILL_MS = 240_000;
-  let watchdog: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<{ success: boolean; message: string }>((resolve) => {
-    watchdog = setTimeout(() => {
-      try {
-        bot.pathfinder.stop();
-      } catch {
-        /* best effort */
-      }
-      try {
-        // Release a hung bot.dig too — otherwise the orphaned skill promise
-        // stays blocked on it and keeps contesting the pathfinder with the
-        // reactive brain (observed: Flora's flee failing "Stuck" mid-hang).
-        bot.stopDigging();
-      } catch {
-        /* wasn't digging */
-      }
-      abortController.abort();
-      resolve({
-        success: false,
-        message: `${skill.name} timed out after ${MAX_SKILL_MS / 1000}s — aborted to free the bot.`,
-      });
-    }, MAX_SKILL_MS);
-    watchdog.unref?.();
-  });
+    if (activeSkillMap.has(bot)) bot.chat(quips[Math.floor(Math.random() * quips.length)]);
+  }, 30_000);
 
   try {
-    const result = await Promise.race([skillPromise, timeoutPromise]);
-    const durationSeconds = (Date.now() - startTime) / 1000;
+    const result = await runControlledOperation(bot, "skill", skill.contract?.timeoutMs ?? 240_000, async (token) => {
+      const baseline = skill.contract?.capture?.(bot, params);
+      progress({
+        skillName: skill.name,
+        phase: "Checking preconditions",
+        progress: 0,
+        message: "Validating world state...",
+        active: true,
+      });
 
-    // Record skill attempt in per-bot memory (fallback to singleton for non-registered bots)
-    const memStore = getBotMemoryStore(bot);
-    if (memStore) {
-      memStore.recordSkillAttempt(skill.name, result.success, durationSeconds, result.message);
-    } else {
-      recordSkillAttempt(skill.name, result.success, durationSeconds, result.message);
-    }
+      const parameterChecks: import("../operations/types.js").PostconditionResult[] = Object.entries(skill.params).map(([name, schema]) => {
+        const value = params[name];
+        const present = value !== undefined && value !== null && value !== "";
+        const typeValid = !present || schema.type === "any" || typeof value === schema.type;
+        return {
+          name: `parameter:${name}`,
+          satisfied: (schema.required === false || present) && typeValid,
+          evidence: { expectedType: schema.type, required: schema.required !== false, source: schema.source ?? "llm", present },
+        };
+      });
+      parameterChecks.push(...(skill.contract?.validate?.(params) ?? []));
+      const invalidParameters = parameterChecks.filter((check) => !check.satisfied);
+      if (invalidParameters.length > 0) {
+        return failed("SKILL_INVALID_PARAMETERS", `Cannot start ${skill.name}: parameters are invalid.`, {
+          retryable: false,
+          postconditions: parameterChecks,
+          observations: { invalidParameters: invalidParameters.map((check) => check.name) },
+        });
+      }
+
+      const preconditions = (await skill.contract?.preconditions?.(bot, params)) ?? [];
+      const unsatisfied = preconditions.filter((condition) => !condition.satisfied);
+      if (unsatisfied.length > 0) {
+        return failed("SKILL_PRECONDITION_FAILED", `Cannot start ${skill.name}: preconditions are not satisfied.`, {
+          retryable: skill.contract?.retryable ?? true,
+          postconditions: preconditions,
+          observations: { failedPreconditions: unsatisfied.map((condition) => condition.name) },
+        });
+      }
+
+      const materialsNeeded = skill.estimateMaterials(bot, params);
+      const materialsList = Object.entries(materialsNeeded);
+      if (materialsList.length > 0) {
+        console.log(`[Skill] Materials needed: ${materialsList.map(([name, count]) => `${count}x ${name}`).join(", ")}`);
+        const gathered = await gatherMaterials(bot, materialsNeeded, token.signal, (message, percent) => {
+          progress({
+            skillName: skill.name,
+            phase: "Gathering materials",
+            progress: percent * 0.3,
+            message,
+            active: true,
+          });
+        });
+        if (!gathered.success) {
+          return failed("MATERIAL_GATHER_FAILED", gathered.message, {
+            retryable: true,
+            observations: { materialsNeeded },
+          });
+        }
+      }
+
+      if (token.signal.aborted) {
+        return operationResult("cancelled", "SKILL_CANCELLED", `Skill ${skill.name} was interrupted.`);
+      }
+
+      const normalized = await skill.execute(bot, params, token.signal, (next) => {
+        progress({ ...next, progress: 0.3 + next.progress * 0.7 });
+      });
+
+      const contractPostconditions = (await skill.contract?.postconditions?.(bot, params, baseline)) ?? [];
+      const postconditions = [...normalized.postconditions, ...contractPostconditions];
+      if (postconditions.some((condition) => !condition.satisfied)) {
+        return operationResult("partial", "SKILL_POSTCONDITION_FAILED", normalized.message, {
+          retryable: skill.contract?.retryable ?? true,
+          worldChanged: normalized.worldChanged,
+          observations: normalized.observations,
+          progress: normalized.progress,
+          postconditions,
+        });
+      }
+      return { ...normalized, postconditions };
+    });
+
+    const durationSeconds = (Date.now() - startTime) / 1000;
+    const success = result.status === "succeeded";
+    const memory = getBotMemoryStore(bot);
+    if (memory) memory.recordSkillAttempt(skill.name, success, durationSeconds, result.message);
+    else recordSkillAttempt(skill.name, success, durationSeconds, result.message);
 
     progress({
       skillName: skill.name,
-      phase: result.success ? "Complete!" : "Failed",
-      progress: result.success ? 1.0 : 0,
+      phase: success ? "Complete!" : result.status,
+      progress: success ? 1 : 0,
       message: result.message,
       active: false,
     });
-
-    console.log(`[Skill] "${skill.name}" finished: ${result.message}`);
-    return result.message;
-  } catch (err: any) {
+    console.log(
+      `[Skill] "${skill.name}" finished [${result.code}] operation=${result.operationId ?? "unknown"} started=${result.startedAt ?? startTime} ended=${result.endedAt ?? Date.now()}: ${result.message} postconditions=${JSON.stringify(result.postconditions)}`,
+    );
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     const durationSeconds = (Date.now() - startTime) / 1000;
-    const memStore = getBotMemoryStore(bot);
-    if (memStore) {
-      memStore.recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${err.message}`);
-    } else {
-      recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${err.message}`);
-    }
-
-    progress({ skillName: skill.name, phase: "Crashed", progress: 0, message: err.message, active: false });
-    return `Skill ${skill.name} crashed: ${err.message}`;
+    const memory = getBotMemoryStore(bot);
+    if (memory) memory.recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${message}`);
+    else recordSkillAttempt(skill.name, false, durationSeconds, `Crashed: ${message}`);
+    progress({ skillName: skill.name, phase: "Crashed", progress: 0, message, active: false });
+    return failed("SKILL_EXECUTOR_CRASHED", `Skill ${skill.name} crashed: ${message}`, { retryable: true });
   } finally {
-    if (watchdog) clearTimeout(watchdog);
     clearInterval(chatterInterval);
     activeSkillMap.delete(bot);
   }

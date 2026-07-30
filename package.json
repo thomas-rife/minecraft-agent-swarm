@@ -11,6 +11,7 @@
     "server": "cd server && java -Xmx2G -Xms1G -jar paper.jar --nogui",
     "download-skills": "node scripts/download-voyager-skills.mjs",
     "test": "node --import tsx --test --test-force-exit src/**/*.test.ts",
+    "smoke:reliability": "tsx src/eval/reliability-smoke.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write 'src/**/*.ts'",

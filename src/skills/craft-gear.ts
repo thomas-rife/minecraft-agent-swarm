@@ -1,10 +1,12 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { LOG_TYPES } from "./materials.js";
 import mcDataLoader from "minecraft-data";
 import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
 import { Vec3 } from "vec3";
+import { safeGoto } from "../bot/navigation.js";
 
 /** Tool tiers from best to worst. */
 const TIERS = [
@@ -21,7 +23,7 @@ const TOOL_TYPES = ["pickaxe", "axe", "sword", "shovel"];
 const ARMOR_TYPES = ["helmet", "chestplate", "leggings", "boots"];
 const ARMOR_TIERS = ["diamond", "iron"]; // only metal armor is worth crafting
 
-export const craftGearSkill: Skill = {
+export const craftGearSkill = defineSkill({
   name: "craft_gear",
   description:
     "Craft the best tools (pickaxe, axe, sword, shovel) AND armor (helmet, chestplate, leggings, boots) from available materials; pulls iron from the stash. The bot auto-equips crafted armor.",
@@ -209,7 +211,7 @@ export const craftGearSkill: Skill = {
           bot.pathfinder.setMovements(moves);
           try {
             await Promise.race([
-              bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2)),
+              safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000),
               new Promise<void>((_, rej) =>
                 setTimeout(() => {
                   bot.pathfinder.stop();
@@ -272,7 +274,7 @@ export const craftGearSkill: Skill = {
           moves.canDig = false;
           bot.pathfinder.setMovements(moves);
           try {
-            await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+            await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
           } catch {
             /* try anyway */
           }
@@ -322,7 +324,7 @@ export const craftGearSkill: Skill = {
       stats: { toolsCrafted: newlyCrafted.length },
     };
   },
-};
+});
 
 /** Craft one gear item (tool/armor) at a crafting table, verifying it appeared. Returns true if crafted. */
 async function craftPiece(
@@ -347,7 +349,7 @@ async function craftPiece(
     moves.canDig = false;
     bot.pathfinder.setMovements(moves);
     try {
-      await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+      await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
     } catch {
       /* try anyway */
     }

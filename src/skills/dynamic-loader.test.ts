@@ -40,7 +40,7 @@ test("dynamic-loader: skill executes in sandboxed context", async () => {
   const result = await skill.execute(mockBot, {}, new AbortController().signal, () => {});
 
   assert.ok(mockBot.__ran, "skill should have set __ran on bot");
-  assert.ok(result.success);
+  assert.equal(result.status, "succeeded");
 
   fs.unlinkSync(skillPath);
   skillRegistry.delete("testMock");

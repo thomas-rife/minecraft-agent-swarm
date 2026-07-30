@@ -1,10 +1,12 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillResult } from "./types.js";
+import type { SkillResult } from "./types.js";
+import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { withdrawStash } from "./stash.js";
+import { safeGoto } from "../bot/navigation.js";
 
 /** Items that can be smelted: input → output name. */
 const SMELT_RECIPES: Record<string, string> = {
@@ -41,7 +43,7 @@ const FUEL_ITEMS = [
   "pale_oak_planks", // MC 1.21.4
 ];
 
-export const smeltOresSkill: Skill = {
+export const smeltOresSkill = defineSkill({
   name: "smelt_ores",
   description:
     "Smelt raw ores into ingots using a furnace. Crafts and places a furnace if needed (8 cobblestone). Uses coal or wood as fuel.",
@@ -303,7 +305,7 @@ export const smeltOresSkill: Skill = {
       stats: { itemsSmelted: smelted },
     };
   },
-};
+});
 
 function setMovements(bot: Bot) {
   const moves = new Movements(bot);
@@ -318,7 +320,7 @@ function setMovements(bot: Bot) {
  *  otherwise hangs smelt_ores to the 240s skill watchdog, stalling the smelter. */
 async function gotoTimed(bot: Bot, goal: any, ms: number): Promise<void> {
   await Promise.race([
-    bot.pathfinder.goto(goal),
+    safeGoto(bot, goal, ms),
     new Promise<void>((_, rej) =>
       setTimeout(() => {
         bot.pathfinder.stop();
