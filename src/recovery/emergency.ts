@@ -15,8 +15,11 @@ export interface EmergencyState {
 
 export class EmergencyManager {
   private active: EmergencyState | null = null;
-  private lastPosition?: { x: number; y: number; z: number };
-  private stationaryChecks = 0;
+  private trapRetryAfter = 0;
+
+  // A failed recovery should not become a tight cancellation loop. A later
+  // navigation failure can request another attempt after this backoff.
+  private static readonly TRAP_RETRY_BACKOFF_MS = 30_000;
 
   getActive(): EmergencyState | null {
     return this.active;
@@ -24,17 +27,16 @@ export class EmergencyManager {
 
   observe(bot: Bot): EmergencyState | null {
     const now = Date.now();
-    if (consumeNavigationRecoveryRequest(bot)) return this.enter("TRAPPED", now);
     const water = waterState(bot);
     if (!water.dry) return this.enter("WATER_ESCAPE", now);
 
-    const pos = bot.entity.position;
-    if (this.lastPosition) {
-      const displacement = Math.hypot(pos.x - this.lastPosition.x, pos.y - this.lastPosition.y, pos.z - this.lastPosition.z);
-      this.stationaryChecks = displacement < 0.2 ? this.stationaryChecks + 1 : 0;
+    // Standing still is normal while idle, planning, crafting, or waiting for
+    // another bot. Only navigation's own progress detector has enough context
+    // to decide that a movement attempt is actually stuck.
+    const navigationRecovery = consumeNavigationRecoveryRequest(bot);
+    if (navigationRecovery && now >= this.trapRetryAfter) {
+      return this.enter("TRAPPED", now);
     }
-    this.lastPosition = { x: pos.x, y: pos.y, z: pos.z };
-    if (this.stationaryChecks >= 5 && pos.y < 67) return this.enter("TRAPPED", now);
 
     if (this.active?.kind === "WATER_ESCAPE" && water.dry) return this.active;
     return this.active;
@@ -85,10 +87,12 @@ export class EmergencyManager {
               retryable: true,
             });
       });
-      if (result.status === "succeeded") {
-        this.stationaryChecks = 0;
-        this.active = null;
-      }
+      // Recovery navigation can itself emit a recovery request. Consume that
+      // internal request, clear this emergency after one bounded attempt, and
+      // allow normal planning to resume instead of cancelling every 3 seconds.
+      consumeNavigationRecoveryRequest(bot);
+      this.active = null;
+      this.trapRetryAfter = Date.now() + EmergencyManager.TRAP_RETRY_BACKOFF_MS;
       return result;
     }
 
