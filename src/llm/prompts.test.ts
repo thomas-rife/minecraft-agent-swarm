@@ -9,11 +9,9 @@ test("strategic prompt exposes only configured skills", () => {
     allowedActions: ["explore", "place_block", "craft"],
     allowedSkills: ["build_farm"],
   });
-  assert.match(prompt, /SKILL: build_farm/);
-  assert.match(prompt, /PURPOSE:/);
-  assert.match(prompt, /PRECONDITIONS:/);
-  assert.match(prompt, /SUCCESS:/);
-  assert.match(prompt, /RECOVERY:/);
+  assert.match(prompt, /- build_farm/);
+  assert.match(prompt, /Use when:/);
+  assert.match(prompt, /Requires:/);
   assert.doesNotMatch(prompt, /build_house/);
   assert.doesNotMatch(prompt, /generate_skill/);
   assert.doesNotMatch(prompt, /place_block/);

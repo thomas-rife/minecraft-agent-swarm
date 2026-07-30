@@ -22,6 +22,7 @@ import { isNeuralServerRunning } from "../neural/bridge.js";
 import { BotBrain, type ChatMessage, type BrainEvents } from "./brain.js";
 import { recordDeath, startScoreboard } from "./scoreboard.js";
 import { recordDiagnosticEvent } from "../util/diagnostic-log.js";
+import { isServerFeedbackMessage } from "./chat-classifier.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -242,7 +243,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
       return;
     }
     // Ignore server system messages (gamerule results, TP confirmations, etc.)
-    if (message.startsWith("Gamerule ") || message.startsWith("Set spawn") || message.startsWith("Teleported ")) return;
+    if (isServerFeedbackMessage(message)) return;
     console.log(`[MC Chat] ${username}: ${message}`);
 
     // Eval commands

@@ -1,7 +1,7 @@
 import type { Bot } from "mineflayer";
 import type { SkillResult } from "./types.js";
 import { defineSkill } from "./define.js";
-import { LOG_TYPES } from "./materials.js";
+import { LOG_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
 import mcDataLoader from "minecraft-data";
 import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
@@ -29,9 +29,25 @@ export const craftGearSkill = defineSkill({
     "Craft the best tools (pickaxe, axe, sword, shovel) AND armor (helmet, chestplate, leggings, boots) from available materials; pulls iron from the stash. The bot auto-equips crafted armor.",
   params: {},
 
-  estimateMaterials(_bot, _params) {
-    // This skill uses whatever is already in inventory — no gathering phase
-    return {};
+  estimateMaterials(bot, _params) {
+    // Resolve the wooden-pickaxe dependency tree before attempting any gear:
+    // logs -> planks -> table/sticks -> pickaxe. The skill executor gathers
+    // this material target and does not return to the LLM between steps.
+    if (bot.inventory.items().some((item) => item.name.endsWith("_pickaxe"))) return {};
+
+    const logs = countAllLogs(bot);
+    const planks = countAllPlanks(bot);
+    const sticks = bot.inventory
+      .items()
+      .filter((item) => item.name === "stick")
+      .reduce((total, item) => total + item.count, 0);
+    const hasTable =
+      bot.inventory.items().some((item) => item.name === "crafting_table") ||
+      !!bot.findBlock({ matching: (block) => block.name === "crafting_table", maxDistance: 32 });
+    const planksRequired = 3 + (sticks >= 2 ? 0 : 2) + (hasTable ? 0 : 4);
+    const woodEquivalent = logs * 4 + planks;
+    const deficit = Math.max(0, planksRequired - woodEquivalent);
+    return deficit > 0 ? { log: logs + Math.ceil(deficit / 4) } : {};
   },
 
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {

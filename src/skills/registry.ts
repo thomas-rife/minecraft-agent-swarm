@@ -59,3 +59,20 @@ export function getSkillPromptLines(allowedNames?: readonly string[]): string {
   }
   return lines.join("\n\n");
 }
+/** Compact contracts for CPU-bound strategic prompts; execution still enforces the full contract. */
+export function getCompactSkillPromptLines(allowedNames?: readonly string[]): string {
+  const lines: string[] = [];
+  for (const skill of skillRegistry.values()) {
+    if (allowedNames && !allowedNames.includes(skill.name)) continue;
+    const params = Object.keys(skill.params).length
+      ? `{${Object.entries(skill.params)
+          .map(([name, schema]) => `${name}:${schema.type}${schema.source === "system" ? "[system]" : ""}`)
+          .join(",")}}`
+      : "{}";
+    const contract = skill.contract;
+    lines.push(
+      `- ${skill.name} ${params}: ${contract?.purpose ?? skill.description} Use when: ${contract?.useWhen ?? "needed"}. Requires: ${contract?.requiredStatus?.join(", ") ?? "runtime checks"}.`,
+    );
+  }
+  return lines.join("\n");
+}

@@ -69,6 +69,7 @@ export function countAllPlanks(bot: Bot): number {
 
 /** Block types that can be mined to obtain an item */
 const MINE_SOURCES: Record<string, string[]> = {
+  log: [...LOG_TYPES],
   oak_log: ["oak_log"],
   spruce_log: ["spruce_log"],
   birch_log: ["birch_log"],
@@ -90,6 +91,8 @@ export interface GatherResult {
 
 /** Count how many of an item the bot currently has. */
 function countItem(bot: Bot, itemName: string): number {
+  if (itemName === "log") return countAllLogs(bot);
+  if (itemName === "planks") return countAllPlanks(bot);
   return bot.inventory
     .items()
     .filter((i) => i.name === itemName)

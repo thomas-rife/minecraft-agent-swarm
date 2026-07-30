@@ -12,6 +12,7 @@ import {
 } from "./prompts.js";
 import { createLogger } from "../util/logger.js";
 import { recordLlmResponse } from "../bot/scoreboard.js";
+import { localLlmQueue } from "./scheduler.js";
 
 /** Model-aware think option. qwen3.6 needs think:false (it otherwise burns the
  *  whole token budget reasoning — the original gotcha). gpt-oss models are
@@ -31,23 +32,56 @@ function samplingFor(model: string, temperature: number) {
   return { temperature, repeat_penalty: 1.15 };
 }
 
-const ollama = new Ollama({ host: config.ollama.host });
 const llmLog = createLogger();
-const LLM_TIMEOUT_MS = 45_000;
 
-async function chatTimed(label: string, request: Parameters<Ollama["chat"]>[0], timeoutMs = LLM_TIMEOUT_MS): Promise<any> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      ollama.chat(request),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`)), timeoutMs);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+async function chatTimed(
+  label: string,
+  request: Parameters<Ollama["chat"]>[0],
+  timeoutMs = config.ollama.requestTimeoutMs,
+): Promise<any> {
+  const queuedAt = Date.now();
+  return localLlmQueue.run(async () => {
+    const queueWaitMs = Date.now() - queuedAt;
+    if (queueWaitMs >= 1_000) {
+      llmLog.info("LLM:queue", `${label} waited ${queueWaitMs}ms for the local CPU model.`);
+    }
+
+    // The Ollama JS client does not expose cancellation for non-streaming chat
+    // calls. Use the HTTP endpoint directly so a timed-out request is aborted
+    // before the serial queue advances; otherwise abandoned generations keep
+    // consuming CPU and make every following request time out too.
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const endpoint = `${config.ollama.host.replace(/\/+$/, "")}/api/chat`;
+    try {
+      const response = await Promise.race([
+        fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(request),
+          signal: controller.signal,
+        }).then(async (value) => {
+          if (!value.ok) throw new Error(`OLLAMA_HTTP_${value.status}: ${(await value.text()).slice(0, 300)}`);
+          return value.json();
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+            reject(new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`));
+          }, timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      return response;
+    } catch (error) {
+      if (timedOut) throw new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`, { cause: error });
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  });
 }
 
 export interface LLMTool {
@@ -273,7 +307,7 @@ export async function queryStrategic(
         num_ctx: config.ollama.contextLength,
         // Strategic decisions are compact JSON. Keep enough room for gpt-oss
         // reasoning while preventing one request from monopolizing the queue.
-        num_predict: 512,
+        num_predict: 192,
       },
     });
     recordLlmResponse("strategic", config.ollama.model, response, Date.now() - startedAt);
@@ -549,7 +583,7 @@ export async function queryLLM(
         options: {
           ...samplingFor(config.ollama.fastModel, 0.6),
           num_ctx: config.ollama.contextLength,
-          num_predict: 512,
+          num_predict: 192,
         },
       });
     }
@@ -584,7 +618,7 @@ export async function chatWithLLM(prompt: string, context: string, roleConfig?: 
       options: {
         ...samplingFor(config.ollama.fastModel, 0.9),
         num_ctx: config.ollama.contextLength,
-        num_predict: 150,
+        num_predict: 96,
       },
     });
     // Strip <think> tokens that qwen3 models sometimes leak

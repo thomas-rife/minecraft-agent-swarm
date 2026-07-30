@@ -9,7 +9,7 @@
  * - Chat (~200 tokens)       — respond to players, uses fast model
  */
 
-import { getSkillPromptLines } from "../skills/registry.js";
+import { getCompactSkillPromptLines } from "../skills/registry.js";
 
 export interface RoleContext {
   name: string;
@@ -82,7 +82,7 @@ export function buildStrategicPrompt(role: RoleContext): string {
     : renderActions(universalNames.filter((name) => strategicCapabilities.has(name)));
 
   // Skills list
-  const skillLines = getSkillPromptLines(role.allowedSkills);
+  const skillLines = getCompactSkillPromptLines(role.allowedSkills);
 
   const missionLine = role.seasonGoal
     ? `🎯 MISSION: ${role.seasonGoal}\nEvery decision should advance this mission.\n\n`
