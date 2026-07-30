@@ -7,7 +7,13 @@ const SERVER_FEEDBACK_PATTERNS = [
   /^Spread \d+ entit(?:y|ies)(?:\/entities)? around\b/i,
 ];
 
+const LEGACY_BOT_USERNAMES = new Set(["atlas", "flora", "forge"]);
+
 export function isServerFeedbackMessage(message: string): boolean {
   const normalized = message.trim();
   return SERVER_FEEDBACK_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function isLegacyBotUsername(username: string): boolean {
+  return LEGACY_BOT_USERNAMES.has(username.trim().toLowerCase());
 }

@@ -22,7 +22,7 @@ import { isNeuralServerRunning } from "../neural/bridge.js";
 import { BotBrain, type ChatMessage, type BrainEvents } from "./brain.js";
 import { recordDeath, startScoreboard } from "./scoreboard.js";
 import { recordDiagnosticEvent } from "../util/diagnostic-log.js";
-import { isServerFeedbackMessage } from "./chat-classifier.js";
+import { isLegacyBotUsername, isServerFeedbackMessage } from "./chat-classifier.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -229,12 +229,17 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   // In-game chat — ignore self. Other bots are heard ONLY when they address this
   // bot by name, and at most once per sender per cooldown window. This enables
   // team coordination ("Peter! Craft a chest!") without runaway feedback loops.
-  const BOT_USERNAMES = new Set(BOT_ROSTER.flatMap((role) => [role.name, role.username]));
+  const BOT_USERNAMES = new Set(
+    BOT_ROSTER.flatMap((role) => [role.name, role.username]).map((name) => name.toLowerCase()),
+  );
   const BOT_CHAT_COOLDOWN_MS = 45_000;
   const lastBotChatHeard = new Map<string, number>();
   bot.on("chat", async (username, message) => {
     if (!username || username === bot.username) return;
-    if (BOT_USERNAMES.has(username)) {
+    // Retired agents may still be connected from an older process. Never let
+    // their generated chat enter the current three-bot LLM queue.
+    if (isLegacyBotUsername(username)) return;
+    if (BOT_USERNAMES.has(username.toLowerCase())) {
       const mentionsMe = message.toLowerCase().includes(roleConfig.name.toLowerCase());
       const last = lastBotChatHeard.get(username) ?? 0;
       if (!mentionsMe || Date.now() - last < BOT_CHAT_COOLDOWN_MS) return;

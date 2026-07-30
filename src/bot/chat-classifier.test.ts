@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isServerFeedbackMessage } from "./chat-classifier.js";
+import { isLegacyBotUsername, isServerFeedbackMessage } from "./chat-classifier.js";
 
 test("spreadplayers confirmations are classified as server feedback", () => {
   assert.equal(
@@ -19,4 +19,10 @@ test("other command confirmations are classified as server feedback", () => {
 
 test("ordinary player chat is not classified as server feedback", () => {
   assert.equal(isServerFeedbackMessage("Milo, can you spread these seeds around the farm?"), false);
+});
+test("retired swarm usernames remain classified as bots", () => {
+  assert.equal(isLegacyBotUsername("Atlas"), true);
+  assert.equal(isLegacyBotUsername("flora"), true);
+  assert.equal(isLegacyBotUsername("FORGE"), true);
+  assert.equal(isLegacyBotUsername("RealPlayer"), false);
 });

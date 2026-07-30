@@ -13,6 +13,7 @@ import {
 import { createLogger } from "../util/logger.js";
 import { recordLlmResponse } from "../bot/scoreboard.js";
 import { localLlmQueue } from "./scheduler.js";
+import { nonStreamingChatPayload } from "./transport.js";
 
 /** Model-aware think option. qwen3.6 needs think:false (it otherwise burns the
  *  whole token budget reasoning — the original gotcha). gpt-oss models are
@@ -59,7 +60,7 @@ async function chatTimed(
         fetch(endpoint, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(request),
+          body: JSON.stringify(nonStreamingChatPayload(request)),
           signal: controller.signal,
         }).then(async (value) => {
           if (!value.ok) throw new Error(`OLLAMA_HTTP_${value.status}: ${(await value.text()).slice(0, 300)}`);
