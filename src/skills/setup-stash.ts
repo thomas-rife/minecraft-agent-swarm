@@ -21,9 +21,13 @@ export const setupStashSkill = defineSkill({
     z: { type: "number", description: "Canonical stash Z coordinate", required: true, source: "system" },
   },
 
-  estimateMaterials(_bot, _params) {
-    // 2 chests = 16 planks = 4 logs. Gathering is handled inside execute().
-    return {};
+  estimateMaterials(bot, _params) {
+    const logs = countAllLogs(bot);
+    const hasTable =
+      bot.inventory.items().some((item) => item.name === "crafting_table") ||
+      !!bot.findBlock({ matching: (block) => block.name === "crafting_table", maxDistance: 32 });
+    const deficit = Math.max(0, 16 + (hasTable ? 0 : 4) - (countAllPlanks(bot) + logs * 4));
+    return deficit > 0 ? { log: logs + Math.ceil(deficit / 4) } : ({} as Record<string, number>);
   },
 
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {
@@ -142,7 +146,10 @@ export const setupStashSkill = defineSkill({
     if (chestCount < 2) {
       // Need to craft chests — check for planks
       const planksHave = countAllPlanks(bot);
-      const planksNeeded = (2 - chestCount) * 8; // 8 planks per chest
+      const hasTable =
+        bot.inventory.items().some((item) => item.name === "crafting_table") ||
+        !!bot.findBlock({ matching: (block) => block.name === "crafting_table", maxDistance: 32 });
+      const planksNeeded = (2 - chestCount) * 8 + (hasTable ? 0 : 4); // include bootstrap table cost
 
       if (planksHave < planksNeeded) {
         // Try crafting planks from logs

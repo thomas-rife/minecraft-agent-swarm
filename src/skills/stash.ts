@@ -7,10 +7,14 @@ import { recordStashTransaction, snapshotChest } from "./stash-ledger.js";
 import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
 import { safeGoto } from "../bot/navigation.js";
+import { verifyCanonicalStash } from "../world/registry.js";
 
 const stashLocks = new Map<string, Promise<void>>();
 
-export async function withStashLock<T>(stashPos: { x: number; y: number; z: number }, work: () => Promise<T>): Promise<T> {
+export async function withStashLock<T>(
+  stashPos: { x: number; y: number; z: number },
+  work: () => Promise<T>,
+): Promise<T> {
   const key = `${Math.floor(stashPos.x)},${Math.floor(stashPos.y)},${Math.floor(stashPos.z)}`;
   const previous = stashLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -38,7 +42,11 @@ function itemCounts(items: Array<{ name: string; count: number }>): Map<string, 
   return counts;
 }
 
-function addContainerDeltas(target: Map<string, number>, before: Map<string, number>, after: Map<string, number>): void {
+function addContainerDeltas(
+  target: Map<string, number>,
+  before: Map<string, number>,
+  after: Map<string, number>,
+): void {
   for (const name of new Set([...before.keys(), ...after.keys()])) {
     const delta = (after.get(name) ?? 0) - (before.get(name) ?? 0);
     if (delta !== 0) target.set(name, (target.get(name) ?? 0) + delta);
@@ -338,6 +346,10 @@ async function depositStashUnlocked(
   };
   // Walk to stash area
   await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
+  const verifiedStash = await verifyCanonicalStash(bot, "shared-stash", stashPos, 6);
+  if (verifiedStash.status !== "verified") {
+    return finishDeposit("STASH_MISSING: canonical storage has not been built yet.");
+  }
 
   // Fail fast if we never actually reached the stash (underground / blocked /
   // being chased). safeGoto returns after its 30s timeout WITHOUT throwing, so
@@ -347,7 +359,9 @@ async function depositStashUnlocked(
   // caused 16 deposit_stash hangs in 9 min when the team was stuck underground.
   const distToStash = bot.entity.position.distanceTo(new Vec3(stashPos.x, stashPos.y, stashPos.z));
   if (distToStash > 6) {
-    return finishDeposit(`Can't reach the stash — ${distToStash.toFixed(0)} blocks away (blocked or underground). Get to the surface near ${stashPos.x},${stashPos.y},${stashPos.z} first.`);
+    return finishDeposit(
+      `Can't reach the stash — ${distToStash.toFixed(0)} blocks away (blocked or underground). Get to the surface near ${stashPos.x},${stashPos.y},${stashPos.z} first.`,
+    );
   }
 
   const itemsToDeposit = bot.inventory.items();
@@ -552,6 +566,10 @@ async function withdrawStashUnlocked(
   count: number,
 ): Promise<string> {
   await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
+  const verifiedStash = await verifyCanonicalStash(bot, "shared-stash", stashPos, 6);
+  if (verifiedStash.status !== "verified") {
+    return "STASH_MISSING: canonical storage has not been built yet.";
+  }
 
   const category = categorizeItem(itemName);
 
@@ -605,7 +623,8 @@ async function withdrawStashUnlocked(
     try {
       await safeGoto(bot, new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2), 10000);
       const container = await openContainerTimed(bot, chest);
-      const chestBefore = container.containerItems()
+      const chestBefore = container
+        .containerItems()
         .filter((item) => item.name.includes(matchName))
         .reduce((total, item) => total + item.count, 0);
 
@@ -621,7 +640,8 @@ async function withdrawStashUnlocked(
           }
         }
       }
-      const chestAfter = container.containerItems()
+      const chestAfter = container
+        .containerItems()
         .filter((item) => item.name.includes(matchName))
         .reduce((total, item) => total + item.count, 0);
       containerDelta += chestAfter - chestBefore;
@@ -646,10 +666,13 @@ async function withdrawStashUnlocked(
     return message;
   };
   if (gained <= 0 && withdrawn > 0) {
-    return finishWithdraw(`Tried to withdraw ${itemName} but it never reached your inventory (stash transfer failed) — the stash may be empty of it. Gather it yourself or check a different item.`);
+    return finishWithdraw(
+      `Tried to withdraw ${itemName} but it never reached your inventory (stash transfer failed) — the stash may be empty of it. Gather it yourself or check a different item.`,
+    );
   }
   if (gained === 0) return finishWithdraw(`No ${itemName} in the stash. Gather it yourself instead.`);
-  if (gained < needed) return finishWithdraw(`Withdrew ${gained}x ${itemName} from stash (wanted ${needed} — that's all there was).`);
+  if (gained < needed)
+    return finishWithdraw(`Withdrew ${gained}x ${itemName} from stash (wanted ${needed} — that's all there was).`);
   return finishWithdraw(`Withdrew ${gained}x ${itemName} from stash.`);
 }
 

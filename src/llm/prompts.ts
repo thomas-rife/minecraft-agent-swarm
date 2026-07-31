@@ -38,8 +38,6 @@ const ACTION_SIGNATURES: Record<string, string> = {
   place_block: 'place_block {"blockType":"oak_planks"}',
   sleep: "sleep {}",
   idle: "idle {}",
-  chat: 'chat {"message":"..."}',
-  respond_to_chat: 'respond_to_chat {"message":"..."}',
   invoke_skill: 'invoke_skill {"skill":"exact_skill_name"}',
   generate_skill: 'generate_skill {"task":"description"}',
   neural_combat: 'neural_combat {"duration":5}',
@@ -56,23 +54,10 @@ export function buildStrategicPrompt(role: RoleContext): string {
   const name = role.name;
 
   // Build action list — role-specific if configured, otherwise full list
-  const universalNames = [
-    "explore",
-    "idle",
-    "respond_to_chat",
-    "invoke_skill",
-    "give_item",
-    "deposit_stash",
-    "withdraw_stash",
-  ].filter((name) => name !== "invoke_skill" || role.allowedSkills === undefined || role.allowedSkills.length > 0);
-  const strategicCapabilities = new Set([
-    "explore",
-    "idle",
-    "respond_to_chat",
-    "invoke_skill",
-    "deposit_stash",
-    "withdraw_stash",
-  ]);
+  const universalNames = ["explore", "idle", "invoke_skill", "give_item", "deposit_stash", "withdraw_stash"].filter(
+    (name) => name !== "invoke_skill" || role.allowedSkills === undefined || role.allowedSkills.length > 0,
+  );
+  const strategicCapabilities = new Set(["explore", "idle", "invoke_skill", "deposit_stash", "withdraw_stash"]);
   const actions = role.allowedActions?.length
     ? renderActions(
         [...role.allowedActions, ...universalNames.filter((u) => !role.allowedActions!.includes(u))].filter((name) =>
@@ -88,7 +73,7 @@ export function buildStrategicPrompt(role: RoleContext): string {
     ? `🎯 MISSION: ${role.seasonGoal}\nEvery decision should advance this mission.\n\n`
     : "";
 
-  return `${missionLine}You are ${name}, an AI playing Minecraft on a livestream. Chat controls you.
+  return `${missionLine}You are ${name}, an AI playing Minecraft autonomously.
 ${role.personality}
 
 ${role.role ? `ROLE: ${role.role}\n` : ""}ACTIONS: ${actions}

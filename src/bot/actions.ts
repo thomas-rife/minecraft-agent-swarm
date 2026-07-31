@@ -35,6 +35,11 @@ const DIRECT_ACTION_TIMEOUT_MS = 150_000;
  * (double-bounding would preempt legit long skills like build_house).
  */
 export async function executeAction(bot: Bot, action: string, params: Record<string, any>): Promise<OperationResult> {
+  if (action === "chat" || action === "respond_to_chat") {
+    return failed("CHAT_DISABLED", "Conversational chat is disabled; scripted background quips remain available.", {
+      retryable: false,
+    });
+  }
   const delegatesToSkill = action === "invoke_skill" || skillRegistry.get(action) !== undefined;
   if (delegatesToSkill) {
     const result = await executeLegacyAction(bot, action, params);
@@ -47,7 +52,11 @@ export async function executeAction(bot: Bot, action: string, params: Record<str
   });
 }
 
-async function executeLegacyAction(bot: Bot, action: string, params: Record<string, any>): Promise<string | OperationResult> {
+async function executeLegacyAction(
+  bot: Bot,
+  action: string,
+  params: Record<string, any>,
+): Promise<string | OperationResult> {
   const delegatesToSkill = action === "invoke_skill" || skillRegistry.get(action) !== undefined;
   if (delegatesToSkill) {
     return executeActionInner(bot, action, params);
@@ -92,7 +101,10 @@ function captureActionState(bot: Bot): ActionState {
 }
 
 function itemCount(bot: Bot, name: string): number {
-  return bot.inventory.items().filter((item) => item.name === name).reduce((total, item) => total + item.count, 0);
+  return bot.inventory
+    .items()
+    .filter((item) => item.name === name)
+    .reduce((total, item) => total + item.count, 0);
 }
 
 async function verifyDirectAction(
@@ -140,21 +152,33 @@ async function verifyDirectAction(
   }
   if (action === "eat") {
     const improved = bot.food > before.food || bot.health > before.health;
-    const postcondition = { name: "nutrition_improved", satisfied: improved, evidence: { before: before.food, after: bot.food } };
+    const postcondition = {
+      name: "nutrition_improved",
+      satisfied: improved,
+      evidence: { before: before.food, after: bot.food },
+    };
     return improved
       ? succeeded("FOOD_CONSUMED", message, { postconditions: [postcondition] })
       : failed("EAT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
   }
   if (["explore", "gather_wood", "mine_block", "place_block", "build_shelter"].includes(action)) {
     const moved = bot.entity.position.distanceTo(before.position) > 1;
-    const inventoryChanged = bot.inventory.items().some((item) => item.count !== (before.inventory.get(item.name) ?? 0));
+    const inventoryChanged = bot.inventory
+      .items()
+      .some((item) => item.count !== (before.inventory.get(item.name) ?? 0));
     const changed = moved || inventoryChanged;
-    const postcondition = { name: "observable_world_progress", satisfied: changed, evidence: { moved, inventoryChanged } };
+    const postcondition = {
+      name: "observable_world_progress",
+      satisfied: changed,
+      evidence: { moved, inventoryChanged },
+    };
     return changed
       ? succeeded("ACTION_PROGRESS_VERIFIED", message, { postconditions: [postcondition] })
       : failed("ACTION_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
   }
-  if (["attack", "neural_combat", "neural_navigation", "give_item", "sleep", "sleep_in_bed", "use_bed"].includes(action)) {
+  if (
+    ["attack", "neural_combat", "neural_navigation", "give_item", "sleep", "sleep_in_bed", "use_bed"].includes(action)
+  ) {
     return operationResult("partial", "ACTION_NOT_FULLY_VERIFIABLE", message, { retryable: true, worldChanged: true });
   }
   if (action === "deposit_stash" || action === "withdraw_stash") {
@@ -183,7 +207,11 @@ async function verifyDirectAction(
   return failed("UNKNOWN_ACTION", message, { retryable: false });
 }
 
-async function executeActionInner(bot: Bot, action: string, params: Record<string, any>): Promise<string | OperationResult> {
+async function executeActionInner(
+  bot: Bot,
+  action: string,
+  params: Record<string, any>,
+): Promise<string | OperationResult> {
   try {
     switch (action) {
       case "gather_wood":
@@ -290,7 +318,8 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
         // Voyager-style refinement: a dynamic skill that failed with a CODE
         // error (not a precondition) gets its source + error fed back to the
         // LLM for a fix. Fire-and-forget — the bot keeps playing meanwhile.
-        const looksLikeCodeBug = skillResult.code === "SKILL_EXECUTOR_CRASHED" || skillResult.code === "OPERATION_CRASHED";
+        const looksLikeCodeBug =
+          skillResult.code === "SKILL_EXECUTOR_CRASHED" || skillResult.code === "OPERATION_CRASHED";
         const looksLikePrecondition =
           skillResult.code === "SKILL_PRECONDITION_FAILED" || skillResult.code === "MATERIAL_GATHER_FAILED";
         if (
@@ -485,13 +514,40 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
           bot.pathfinder.setMovements(bushMoves);
           await safeGoto(bot, new goals.GoalNear(basePos.x, basePos.y, basePos.z, 2), 20000, 8000);
         }
+        const treeLogs = connectedTreeLogs(bot, basePos, logTypes, 64);
         await digSafe(bot, log);
         gathered++;
         // Fell the WHOLE trunk, not just one block: logs above float (classic
         // Minecraft) and their drops rain down the cleared column to walkable
         // ground. Chopping a single log left drops lodged in the canopy — 78%
         // of chopped logs were lost as unreachable (1138 lost vs 326 gathered).
-        let above = bot.blockAt(basePos.offset(0, 1, 0));
+        // Finish the connected tree, including oak branches. Reposition for
+        // logs outside normal reach instead of abandoning the trunk top.
+        for (const logPos of treeLogs) {
+          if (logPos.equals(basePos)) continue;
+          let treeLog = bot.blockAt(logPos);
+          if (!treeLog || !logTypes.includes(treeLog.name)) continue;
+          try {
+            if (bot.entity.position.distanceTo(logPos) > 4.3) {
+              const treeMoves = new Movements(bot);
+              treeMoves.canDig = true;
+              treeMoves.allow1by1towers = bot.inventory
+                .items()
+                .some((item) => item.name.endsWith("_planks") || ["dirt", "cobblestone", "stone"].includes(item.name));
+              treeMoves.maxDropDown = 2;
+              treeMoves.allowParkour = false;
+              bot.pathfinder.setMovements(treeMoves);
+              await safeGoto(bot, new goals.GoalNear(logPos.x, logPos.y, logPos.z, 3), 15000, 4000);
+              treeLog = bot.blockAt(logPos);
+              if (!treeLog || !logTypes.includes(treeLog.name)) continue;
+            }
+            await digSafe(bot, treeLog);
+            gathered++;
+          } catch {
+            // Continue with the other connected logs.
+          }
+        }
+        let above: import("prismarine-block").Block | null = null;
         let felled = 0;
         // Cap 12, not 6: a 6-cap left the tops of tall oaks floating, and those
         // remnants are exactly what poisons the finder (see count comment above).
@@ -695,6 +751,39 @@ function blockMatcher(blockType: string): { match: (name: string) => boolean; is
  *  bot can't quite reach, a server hiccup) otherwise blocks the brain until the
  *  150s action watchdog fires. mine_block was the top residual watchdog trip
  *  (8 in 11h) from exactly this; stopDigging + reject lets it fail fast. */
+/** Discover a whole tree before the base is removed. Twenty-six-neighbour
+ * connectivity includes branched/diagonal oak trunks while the cap prevents
+ * touching canopies from turning into an unbounded forest operation. */
+function connectedTreeLogs(bot: Bot, start: Vec3, logTypes: readonly string[], cap: number): Vec3[] {
+  const queue = [start.clone()];
+  const result: Vec3[] = [];
+  const seen = new Set<string>();
+  while (queue.length > 0 && result.length < cap) {
+    const position = queue.shift()!;
+    const key = `${position.x},${position.y},${position.z}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const block = bot.blockAt(position);
+    if (!block || !logTypes.includes(block.name)) continue;
+    result.push(position.clone());
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue;
+          const next = position.offset(dx, dy, dz);
+          const nextKey = `${next.x},${next.y},${next.z}`;
+          if (!seen.has(nextKey)) queue.push(next);
+        }
+      }
+    }
+  }
+  return result.sort((a, b) => {
+    const height = a.y - b.y;
+    if (height !== 0) return height;
+    return a.distanceTo(start) - b.distanceTo(start);
+  });
+}
+
 async function digSafe(bot: Bot, block: import("prismarine-block").Block): Promise<void> {
   await Promise.race([
     bot.dig(block),

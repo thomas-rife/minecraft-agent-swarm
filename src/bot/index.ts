@@ -4,6 +4,7 @@ const { pathfinder } = pathfinderPkg;
 import customPvpPkg from "@nxg-org/mineflayer-custom-pvp";
 const customPvp = (customPvpPkg as any).default ?? customPvpPkg;
 import { loader as autoEat } from "mineflayer-auto-eat";
+import { plugin as collectBlock } from "mineflayer-collectblock";
 import { config } from "../config.js";
 import { registerBot as registerViewerBot, isUnifiedViewerStarted } from "../stream/unified-viewer.js";
 import { startViewer } from "../stream/viewer.js";
@@ -88,6 +89,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(customPvp);
   bot.loadPlugin(autoEat);
+  bot.loadPlugin(collectBlock);
 
   // ── Create the event-driven brain ──
   const brain = new BotBrain(bot, roleConfig, events, memStore);
@@ -229,71 +231,74 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   // In-game chat — ignore self. Other bots are heard ONLY when they address this
   // bot by name, and at most once per sender per cooldown window. This enables
   // team coordination ("Peter! Craft a chest!") without runaway feedback loops.
-  const BOT_USERNAMES = new Set(
-    BOT_ROSTER.flatMap((role) => [role.name, role.username]).map((name) => name.toLowerCase()),
-  );
-  const BOT_CHAT_COOLDOWN_MS = 45_000;
-  const lastBotChatHeard = new Map<string, number>();
-  bot.on("chat", async (username, message) => {
-    if (!username || username === bot.username) return;
-    // Retired agents may still be connected from an older process. Never let
-    // their generated chat enter the current three-bot LLM queue.
-    if (isLegacyBotUsername(username)) return;
-    if (BOT_USERNAMES.has(username.toLowerCase())) {
-      const mentionsMe = message.toLowerCase().includes(roleConfig.name.toLowerCase());
-      const last = lastBotChatHeard.get(username) ?? 0;
-      if (!mentionsMe || Date.now() - last < BOT_CHAT_COOLDOWN_MS) return;
-      lastBotChatHeard.set(username, Date.now());
-      brain.queueChat({ source: "minecraft", username, message, timestamp: Date.now() });
-      return;
-    }
-    // Ignore server system messages (gamerule results, TP confirmations, etc.)
-    if (isServerFeedbackMessage(message)) return;
-    console.log(`[MC Chat] ${username}: ${message}`);
-
-    // Eval commands
-    if (message.startsWith("/eval ") || message === "/eval") {
-      const parts = message.trim().split(/\s+/);
-      const { evalSkill, evalAll } = await import("../eval/runner.js");
-      if (parts[1] === "all") {
-        evalAll(bot, parts[2]).catch((e: any) => bot.chat(`[EVAL] Error: ${e.message}`));
-      } else if (parts[1]) {
-        evalSkill(bot, parts[1]).catch((e: any) => bot.chat(`[EVAL] Error: ${e.message}`));
-      } else {
-        bot.chat("[EVAL] Usage: /eval <skillname>  or  /eval all [filter]");
+  const CHAT_INPUT_ENABLED = false;
+  if (CHAT_INPUT_ENABLED) {
+    const BOT_USERNAMES = new Set(
+      BOT_ROSTER.flatMap((role) => [role.name, role.username]).map((name) => name.toLowerCase()),
+    );
+    const BOT_CHAT_COOLDOWN_MS = 45_000;
+    const lastBotChatHeard = new Map<string, number>();
+    bot.on("chat", async (username, message) => {
+      if (!username || username === bot.username) return;
+      // Retired agents may still be connected from an older process. Never let
+      // their generated chat enter the current three-bot LLM queue.
+      if (isLegacyBotUsername(username)) return;
+      if (BOT_USERNAMES.has(username.toLowerCase())) {
+        const mentionsMe = message.toLowerCase().includes(roleConfig.name.toLowerCase());
+        const last = lastBotChatHeard.get(username) ?? 0;
+        if (!mentionsMe || Date.now() - last < BOT_CHAT_COOLDOWN_MS) return;
+        lastBotChatHeard.set(username, Date.now());
+        brain.queueChat({ source: "minecraft", username, message, timestamp: Date.now() });
+        return;
       }
-      return;
-    }
+      // Ignore server system messages (gamerule results, TP confirmations, etc.)
+      if (isServerFeedbackMessage(message)) return;
+      console.log(`[MC Chat] ${username}: ${message}`);
 
-    // !goal commands
-    if (message.startsWith("!goal")) {
-      const parts = message.trim().split(/\s+/);
-      const sub = parts[1]?.toLowerCase();
-      if (sub === "set" && parts.length > 2) {
-        const newGoal = parts.slice(2).join(" ");
-        memStore.setSeasonGoal(newGoal);
-        bot.chat(`Mission accepted: "${newGoal}"`);
-      } else if (sub === "clear") {
-        memStore.clearSeasonGoal();
-        bot.chat("Season goal cleared. Going freeform.");
-      } else if (sub === "show" || !sub) {
-        const current = memStore.getSeasonGoal();
-        bot.chat(current ? `Current mission: "${current}"` : "No season goal set. Use !goal set <text>");
-      } else {
-        bot.chat("Usage: !goal set <text> | !goal clear | !goal show");
+      // Eval commands
+      if (message.startsWith("/eval ") || message === "/eval") {
+        const parts = message.trim().split(/\s+/);
+        const { evalSkill, evalAll } = await import("../eval/runner.js");
+        if (parts[1] === "all") {
+          evalAll(bot, parts[2]).catch((e: any) => bot.chat(`[EVAL] Error: ${e.message}`));
+        } else if (parts[1]) {
+          evalSkill(bot, parts[1]).catch((e: any) => bot.chat(`[EVAL] Error: ${e.message}`));
+        } else {
+          bot.chat("[EVAL] Usage: /eval <skillname>  or  /eval all [filter]");
+        }
+        return;
       }
-      return;
-    }
 
-    // Queue for the brain to process
-    brain.queueChat({
-      source: "minecraft",
-      username,
-      message,
-      timestamp: Date.now(),
+      // !goal commands
+      if (message.startsWith("!goal")) {
+        const parts = message.trim().split(/\s+/);
+        const sub = parts[1]?.toLowerCase();
+        if (sub === "set" && parts.length > 2) {
+          const newGoal = parts.slice(2).join(" ");
+          memStore.setSeasonGoal(newGoal);
+          bot.chat(`Mission accepted: "${newGoal}"`);
+        } else if (sub === "clear") {
+          memStore.clearSeasonGoal();
+          bot.chat("Season goal cleared. Going freeform.");
+        } else if (sub === "show" || !sub) {
+          const current = memStore.getSeasonGoal();
+          bot.chat(current ? `Current mission: "${current}"` : "No season goal set. Use !goal set <text>");
+        } else {
+          bot.chat("Usage: !goal set <text> | !goal clear | !goal show");
+        }
+        return;
+      }
+
+      // Queue for the brain to process
+      brain.queueChat({
+        source: "minecraft",
+        username,
+        message,
+        timestamp: Date.now(),
+      });
+      addChatMessage(username, message, "free");
     });
-    addChatMessage(username, message, "free");
-  });
+  }
 
   // Death cause capture — the server's death message ("X drowned", "X
   // suffocated in a wall", "X fell from a high place"…) arrives as chat just

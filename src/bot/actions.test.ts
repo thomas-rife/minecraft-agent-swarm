@@ -42,26 +42,26 @@ test("executeAction: idle returns vibing message", async () => {
   assert.equal(result.status, "succeeded");
 });
 
-test("executeAction: chat sends message and returns confirmation", async () => {
+test("executeAction: chat cannot consume an action", async () => {
   const bot = mockBot();
   const result = await executeAction(bot, "chat", { message: "Hello world" });
-  assert.equal(result.message, "Said: Hello world");
-  assert.equal(bot._chatLog[0], "Hello world");
+  assert.equal(result.code, "CHAT_DISABLED");
+  assert.equal(bot._chatLog.length, 0);
 });
 
-test("executeAction: chat with no message says nothing and reports the error", async () => {
+test("executeAction: chat remains disabled without params", async () => {
   const bot = mockBot();
   const result = await executeAction(bot, "chat", {});
   assert.equal(bot._chatLog.length, 0);
-  assert.match(result.message, /needs a 'message' param/);
+  assert.equal(result.code, "CHAT_DISABLED");
   assert.equal(result.status, "failed");
 });
 
-test("executeAction: respond_to_chat sends message", async () => {
+test("executeAction: respond_to_chat cannot consume an action", async () => {
   const bot = mockBot();
   const result = await executeAction(bot, "respond_to_chat", { message: "Hey back!" });
-  assert.equal(result.message, "Replied: Hey back!");
-  assert.equal(bot._chatLog[0], "Hey back!");
+  assert.equal(result.code, "CHAT_DISABLED");
+  assert.equal(bot._chatLog.length, 0);
 });
 
 test("executeAction: unknown action returns descriptive error", async () => {

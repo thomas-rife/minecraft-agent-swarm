@@ -30,10 +30,12 @@ export const craftGearSkill = defineSkill({
   params: {},
 
   estimateMaterials(bot, _params) {
-    // Resolve the wooden-pickaxe dependency tree before attempting any gear:
-    // logs -> planks -> table/sticks -> pickaxe. The skill executor gathers
-    // this material target and does not return to the LLM between steps.
-    if (bot.inventory.items().some((item) => item.name.endsWith("_pickaxe"))) return {};
+    // Resolve enough wood for every missing basic tool, not merely the first
+    // pickaxe. This keeps the complete tool chain inside one deterministic run.
+    const missingTools = TOOL_TYPES.filter(
+      (type) => !bot.inventory.items().some((item) => item.name.endsWith(`_${type}`)),
+    );
+    if (missingTools.length === 0) return {} as Record<string, number>;
 
     const logs = countAllLogs(bot);
     const planks = countAllPlanks(bot);
@@ -44,10 +46,10 @@ export const craftGearSkill = defineSkill({
     const hasTable =
       bot.inventory.items().some((item) => item.name === "crafting_table") ||
       !!bot.findBlock({ matching: (block) => block.name === "crafting_table", maxDistance: 32 });
-    const planksRequired = 3 + (sticks >= 2 ? 0 : 2) + (hasTable ? 0 : 4);
+    const planksRequired = 13 + (sticks >= 7 ? 0 : 4) + (hasTable ? 0 : 4);
     const woodEquivalent = logs * 4 + planks;
     const deficit = Math.max(0, planksRequired - woodEquivalent);
-    return deficit > 0 ? { log: logs + Math.ceil(deficit / 4) } : {};
+    return deficit > 0 ? { log: logs + Math.ceil(deficit / 4) } : ({} as Record<string, number>);
   },
 
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {

@@ -59,6 +59,7 @@ import {
 } from "../coordination/task-board.js";
 import { configureStashLedgerPersistence } from "../skills/stash-ledger.js";
 import { cancelActiveOperation } from "../operations/controller.js";
+import { ObjectivePlanner, type PlannedDecision } from "../planning/objective-planner.js";
 
 export interface ChatMessage {
   source: "minecraft" | "twitch" | "youtube";
@@ -109,6 +110,7 @@ export class BotBrain {
   // Decision state (migrated from the old decide() function)
   private goalManager = new GoalManager();
   private emergencyManager = new EmergencyManager();
+  private objectivePlanner = new ObjectivePlanner();
   private emergencyResolving = false;
   private activeTaskId: string | null = null;
   private lastAction = "";
@@ -267,14 +269,18 @@ export class BotBrain {
       const emergency = this.emergencyManager.observe(this.bot);
       if (emergency && !this.emergencyResolving) {
         this.emergencyResolving = true;
-        this.emergencyManager.resolve(this.bot).then((result) => {
-          if (result) {
-            this.events.onAction(emergency.kind, result.message);
-            recordDiagnosticOperation(this.roleConfig.name, `recovery:${emergency.kind}`, result, true);
-          }
-        }).catch(() => {}).finally(() => {
-          this.emergencyResolving = false;
-        });
+        this.emergencyManager
+          .resolve(this.bot)
+          .then((result) => {
+            if (result) {
+              this.events.onAction(emergency.kind, result.message);
+              recordDiagnosticOperation(this.roleConfig.name, `recovery:${emergency.kind}`, result, true);
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this.emergencyResolving = false;
+          });
       }
     }, 3_000);
     this.recoveryTimer.unref?.();
@@ -352,11 +358,16 @@ export class BotBrain {
     this.recoveryTimer = null;
     this.registryTimer = null;
     this.eventQueue.length = 0;
+    this.objectivePlanner.clear();
     void cancelActiveOperation(this.bot);
   }
 
   /** Queue a chat message for processing. */
   queueChat(msg: ChatMessage): void {
+    // Disabled: incoming chat must never consume an LLM call, strategic
+    // decision, or action slot. Scripted executor quips are separate.
+    void msg;
+    return;
     const viewerFilter = filterViewerMessage(msg.message);
     if (!viewerFilter.safe) {
       this.log.debug("Brain", `Filtered viewer message from ${msg.username}: ${viewerFilter.reason}`);
@@ -694,6 +705,18 @@ export class BotBrain {
     // Safety overrides first
     if (await this.runSafetyOverrides()) return;
 
+    // System-owned progression comes before strategic sampling. A configured
+    // coordinate is only an intended stash site; establish and verify the
+    // container before any plan is allowed to depend on it.
+    this.objectivePlanner.ensureBootstrapStash();
+    if (this.objectivePlanner.hasWork()) {
+      const next = this.objectivePlanner.next(this.bot);
+      if (next) {
+        await this.executeDecision(next, "deterministic");
+        return;
+      }
+    }
+
     // Survival override: starvation was killing the team (whole roster at
     // hunger 0, 286 failed "eat" attempts in one run). If hungry with no food
     // on hand, withdraw food from the stash so auto-eat has fuel — no waiting
@@ -936,17 +959,37 @@ export class BotBrain {
     return { kind: "operation_succeeded" };
   }
 
-  private async executeDecision(decision: {
-    thought: string;
-    action: string;
-    params: Record<string, any>;
-    goal?: string;
-    goalSteps?: number;
-  }, scope: "strategic" | "reactive" | "critic" = "strategic"): Promise<void> {
+  private async executeDecision(
+    decision: {
+      thought: string;
+      action: string;
+      params: Record<string, any>;
+      goal?: string;
+      goalSteps?: number;
+    },
+    scope: "strategic" | "reactive" | "critic" | "deterministic" = "strategic",
+  ): Promise<void> {
     // Filter thought for safety
     const thoughtFilter = filterContent(decision.thought);
     if (!thoughtFilter.safe) {
       decision.thought = thoughtFilter.cleaned;
+    }
+
+    if (decision.action === "chat" || decision.action === "respond_to_chat") {
+      const disabled = "Conversational chat is disabled and cannot consume an action or LLM decision.";
+      this.events.onAction(decision.action, disabled);
+      this.lastResult = disabled;
+      if (scope === "deterministic") {
+        this.objectivePlanner.record({
+          status: "failed",
+          code: "CHAT_DISABLED",
+          message: disabled,
+          worldChanged: false,
+          retryable: false,
+          postconditions: [],
+        });
+      }
+      return;
     }
 
     // Filter chat actions
@@ -962,24 +1005,13 @@ export class BotBrain {
     this.log.info("Brain", `"${decision.thought}" → ${decision.action}`);
     this.log.debug("Brain", "Decision params:", JSON.stringify(decision.params));
 
-    const strategicActions = new Set([
-      "explore",
-      "idle",
-      "respond_to_chat",
-      "invoke_skill",
-      "deposit_stash",
-      "withdraw_stash",
-    ]);
-    if (
-      scope === "strategic" &&
-      !strategicActions.has(decision.action) &&
-      !this.roleConfig.allowedSkills.includes(decision.action)
-    ) {
-      const gateMsg = `Strategic decisions may select only high-level skills or ${[...strategicActions].join(", ")}.`;
-      this.events.onAction(decision.action, gateMsg);
-      this.lastResult = gateMsg;
-      this.blockAction(decision.action, gateMsg, BotBrain.FAILURE_TTL_STRUCTURAL_MS);
-      setTimeout(() => this.triggerReplan(), 300);
+    // Strategic output selects an objective only. Recipe leaves, prerequisite
+    // acquisition, retries, and continuation belong to the deterministic
+    // planner and never go back to the LLM.
+    if (scope === "strategic") {
+      this.objectivePlanner.enqueue(decision as PlannedDecision);
+      const next = this.objectivePlanner.next(this.bot);
+      if (next) await this.executeDecision(next, "deterministic");
       return;
     }
 
@@ -1198,6 +1230,7 @@ export class BotBrain {
 
     // ── Execute ──
     const result = await executeAction(this.bot, decision.action, normalizedParams);
+    if (scope === "deterministic") this.objectivePlanner.record(result);
     this.lastAction = decision.action;
     this.lastResult = result.message;
     this.events.onAction(decision.action, result.message);
@@ -1208,7 +1241,11 @@ export class BotBrain {
     this.log.debug(
       "Brain",
       "Postcondition evidence:",
-      JSON.stringify({ objective: decision.action, observations: result.observations, postconditions: result.postconditions }),
+      JSON.stringify({
+        objective: decision.action,
+        observations: result.observations,
+        postconditions: result.postconditions,
+      }),
     );
 
     // Update team bulletin
@@ -1324,6 +1361,12 @@ export class BotBrain {
       this.recentHistory.splice(0, this.recentHistory.length - 8);
     }
 
+    // Continue prerequisite chains from verified state without a critic or
+    // another LLM decision. The next strategic event drains the planner first.
+    if (scope === "deterministic") {
+      setTimeout(() => this.triggerReplan(), 150);
+      return;
+    }
     // ── Trigger critic ──
     if (this.CRITIC_ENABLED && !["idle", "chat", "respond_to_chat"].includes(decision.action)) {
       this.pushEvent({

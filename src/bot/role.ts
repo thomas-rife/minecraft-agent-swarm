@@ -48,8 +48,7 @@ export const ALL_STATIC_SKILLS = [
   "setup_stash",
 ] as const;
 
-const withUniversalCapabilities = (actions: string[]) =>
-  [...new Set([...actions, "neural_combat"])] as string[];
+const withUniversalCapabilities = (actions: string[]) => [...new Set([...actions, "neural_combat"])] as string[];
 
 /** Milo scouts, explores, and guards the team. */
 export const MILO_CONFIG: BotRoleConfig = {
@@ -69,7 +68,6 @@ export const MILO_CONFIG: BotRoleConfig = {
     "go_to",
     "gather_wood",
     "mine_block",
-    "chat",
     "eat",
     "sleep",
     "flee",
@@ -105,15 +103,7 @@ export const AVA_CONFIG: BotRoleConfig = {
   leashRadius: 150,
   stashPos: STASH_POS,
   safeSpawn: HOME_BASE,
-  allowedActions: withUniversalCapabilities([
-    "craft",
-    "eat",
-    "sleep",
-    "go_to",
-    "place_block",
-    "chat",
-    "flee",
-  ]),
+  allowedActions: withUniversalCapabilities(["craft", "eat", "sleep", "go_to", "place_block", "flee"]),
   allowedSkills: [...ALL_STATIC_SKILLS],
   keepItems: [
     { name: "hoe", minCount: 1 },
@@ -151,7 +141,6 @@ export const PETER_CONFIG: BotRoleConfig = {
     "eat",
     "sleep",
     "craft",
-    "chat",
     "flee",
   ]),
   allowedSkills: [...ALL_STATIC_SKILLS],

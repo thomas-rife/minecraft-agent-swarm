@@ -20,7 +20,12 @@ function navigationBot(outcomes: Array<"fail" | "pass">) {
     },
     setControlState: () => {},
   } as any;
-  return { bot, get calls() { return calls; } };
+  return {
+    bot,
+    get calls() {
+      return calls;
+    },
+  };
 }
 
 test("navigation recovery replans and succeeds on a later route", async () => {
@@ -30,10 +35,10 @@ test("navigation recovery replans and succeeds on a later route", async () => {
   assert.equal(consumeNavigationRecoveryRequest(mock.bot), null);
 });
 
-test("exhausted navigation requests deterministic trapped recovery", async () => {
+test("exhausted navigation remains local and does not cancel unrelated operations", async () => {
   const mock = navigationBot(["fail", "fail", "fail"]);
   await assert.rejects(() => safeGoto(mock.bot, { x: 5, y: 64, z: 5 }, 9_000), NavigationRecoveryError);
-  assert.equal(consumeNavigationRecoveryRequest(mock.bot)?.reason, "NO_POSITIONAL_PROGRESS");
+  assert.equal(consumeNavigationRecoveryRequest(mock.bot), null);
 });
 
 test("navigation rejects non-finite targets before moving", async () => {

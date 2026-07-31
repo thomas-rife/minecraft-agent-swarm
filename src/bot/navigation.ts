@@ -117,7 +117,6 @@ export async function safeGoto(bot: Bot, goal: any, timeoutMs = 15000, stallStar
       if (index < candidates.length - 1) await recoveryNudge(bot);
     }
   }
-  recoveryRequests.set(bot, { reason: "NO_POSITIONAL_PROGRESS", requestedAt: Date.now(), causes });
   throw new NavigationRecoveryError("Navigation failed after staged recovery.", candidates.length, causes);
 }
 
@@ -203,25 +202,33 @@ function goalDistance(bot: Bot, goal: any): number | null {
   if (!Number.isFinite(goal?.x) || !Number.isFinite(goal?.z)) {
     return Number.isFinite(goal?.y) ? Math.abs(bot.entity.position.y - goal.y) : null;
   }
-  return bot.entity.position.distanceTo(new Vec3(goal.x, Number.isFinite(goal?.y) ? goal.y : bot.entity.position.y, goal.z));
+  return bot.entity.position.distanceTo(
+    new Vec3(goal.x, Number.isFinite(goal?.y) ? goal.y : bot.entity.position.y, goal.z),
+  );
 }
 
 /** Return to a verified entrance/safe point, with local dig-out as the fallback. */
 export async function recoverToSafePoint(bot: Bot): Promise<boolean> {
-  const entries = [getSharedStructure(`mine-entrance-${bot.username}`), getSharedStructure(`safe-point-${bot.username}`)]
+  const entries = [
+    getSharedStructure(`mine-entrance-${bot.username}`),
+    getSharedStructure(`safe-point-${bot.username}`),
+  ]
     .filter((entry) => entry?.status === "verified" && entry.position)
     .sort((a, b) => {
       const ap = a!.position!;
       const bp = b!.position!;
-      return bot.entity.position.distanceTo(new Vec3(ap.x, ap.y, ap.z)) - bot.entity.position.distanceTo(new Vec3(bp.x, bp.y, bp.z));
+      return (
+        bot.entity.position.distanceTo(new Vec3(ap.x, ap.y, ap.z)) -
+        bot.entity.position.distanceTo(new Vec3(bp.x, bp.y, bp.z))
+      );
     });
   const destination = entries[0]?.position;
   if (destination) {
     const moves = new Movements(bot);
     moves.canDig = true;
-    moves.allow1by1towers = bot.inventory.items().some((item) =>
-      item.name.endsWith("_planks") || ["dirt", "cobblestone", "stone"].includes(item.name),
-    );
+    moves.allow1by1towers = bot.inventory
+      .items()
+      .some((item) => item.name.endsWith("_planks") || ["dirt", "cobblestone", "stone"].includes(item.name));
     moves.maxDropDown = 1;
     bot.pathfinder.setMovements(moves);
     try {
@@ -252,9 +259,11 @@ export async function collectNearbyDrops(bot: Bot, radius = 8, maxMs = 8000): Pr
     try {
       // Stand exactly on the drop's block — GoalNear(r=1) can stop just outside
       // the pickup radius. An unreachable drop falls through to the next one.
-      const p = drop.position.floored();
-      await safeGoto(bot, new goals.GoalBlock(p.x, p.y, p.z), 6000);
-      await new Promise((r) => setTimeout(r, 400)); // pickup tick
+      await Promise.race([
+        bot.collectBlock.collect(drop, { ignoreNoPath: true }),
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error("drop pickup timeout")), 6500)),
+      ]);
+      await new Promise((r) => setTimeout(r, 250));
     } catch {
       // Drop lodged in the canopy? Punch out the leaf it rests on/in so it
       // falls to walkable ground, then allow one retry. Leaf-lodged drops were

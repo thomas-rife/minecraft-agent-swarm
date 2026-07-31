@@ -50,15 +50,14 @@ test("standing still at a low Y coordinate does not create a trapped emergency",
   }
 });
 
-test("failed trapped recovery clears instead of latching and cancelling repeatedly", async () => {
+test("failed navigation does not escalate into global cancellation", async () => {
   const bot = dryBot();
   const manager = new EmergencyManager();
 
   await assert.rejects(() => safeGoto(bot, { x: 5, y: 64, z: 5 }, 1_000));
-  assert.equal(manager.observe(bot)?.kind, "TRAPPED");
+  assert.equal(manager.observe(bot), null);
 
   const result = await manager.resolve(bot);
-  assert.equal(result?.code, "TRAPPED_GEOMETRY_UNRESOLVED");
+  assert.equal(result, null);
   assert.equal(manager.getActive(), null);
-  assert.equal(manager.observe(bot), null);
 });

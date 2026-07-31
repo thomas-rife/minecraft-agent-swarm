@@ -1,15 +1,10 @@
 import { createBot } from "./bot/index.js";
-import { createTwitchChat } from "./stream/twitch.js";
-import { startOverlay, addChatMessage } from "./stream/overlay.js";
+import { startOverlay } from "./stream/overlay.js";
 import { config } from "./config.js";
 import { loadDynamicSkills } from "./skills/dynamic-loader.js";
 import { BOT_ROSTER, type BotRoleConfig } from "./bot/role.js";
 import { startUnifiedViewer } from "./stream/unified-viewer.js";
-import {
-  recordDiagnosticEvent,
-  startDiagnosticLog,
-  stopDiagnosticLog,
-} from "./util/diagnostic-log.js";
+import { recordDiagnosticEvent, startDiagnosticLog, stopDiagnosticLog } from "./util/diagnostic-log.js";
 
 if (config.bot.dynamicSkillsEnabled) loadDynamicSkills();
 
@@ -82,7 +77,7 @@ async function startBot(
     overlayStarted.value = true;
   }
 
-  const { bot, queueChat, stop } = await createBot(
+  const { bot, stop } = await createBot(
     {
       onThought: (thought) => console.log(`[${roleConfig.name}] Thought: ${thought}`),
       onAction: (action, result) => console.log(`[${roleConfig.name}] [${action}] ${result}`),
@@ -91,21 +86,11 @@ async function startBot(
     roleConfig,
   );
 
-  // A single Twitch connection is enough for the whole team.
-  const twitch =
-    roleConfig.name === "Milo"
-      ? createTwitchChat((message) => {
-          queueChat(message);
-          addChatMessage(message.username, message.message, (message as any).tier ?? "free");
-        })
-      : null;
-
   let lastKickReason = "";
 
   return new Promise<string>((resolve) => {
     const cleanup = () => {
       stop();
-      twitch?.client.disconnect();
     };
     activeStops.push(cleanup);
 
