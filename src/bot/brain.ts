@@ -966,6 +966,8 @@ export class BotBrain {
       params: Record<string, any>;
       goal?: string;
       goalSteps?: number;
+      objectiveAction?: string;
+      completesObjective?: boolean;
     },
     scope: "strategic" | "reactive" | "critic" | "deterministic" = "strategic",
   ): Promise<void> {
@@ -1209,18 +1211,19 @@ export class BotBrain {
     if (isLightArea && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
       normalizedParams.stashPos = this.roleConfig.stashPos;
     }
+    const rootAction = decision.objectiveAction ?? decision.action;
 
     if (decision.goal && !this.goalManager.getActive()) {
       const goal = this.goalManager.setGoal({
         type: "strategic",
         description: decision.goal,
-        completion: this.goalPredicateFor(decision.action, normalizedParams),
+        completion: this.goalPredicateFor(rootAction, normalizedParams),
         source: "llm",
       });
       this.activeTaskId = goal.id;
       publishTask({
         id: goal.id,
-        capability: decision.action === "invoke_skill" ? normalizedParams.skill : decision.action,
+        capability: rootAction === "invoke_skill" ? normalizedParams.skill : rootAction,
         description: decision.goal,
       });
       claimTask(goal.id, this.roleConfig.name);
@@ -1329,7 +1332,10 @@ export class BotBrain {
       const position = this.bot.entity.position;
       verifyFarmSite(this.bot, "shared-farm", { x: position.x, y: position.y, z: position.z }, 16);
     }
-    const completedGoal = this.goalManager.evaluateOperation(this.bot, result);
+    const mayCompleteOverallGoal = scope !== "deterministic" || decision.completesObjective === true;
+    const completedGoal = mayCompleteOverallGoal
+      ? this.goalManager.evaluateOperation(this.bot, result)
+      : null;
     if (this.activeTaskId) {
       recordTaskResult(
         this.activeTaskId,

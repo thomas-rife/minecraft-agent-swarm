@@ -12,6 +12,7 @@ import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
 import { operationResult, succeeded } from "../operations/types.js";
 import { upsertSharedStructure } from "../world/registry.js";
 
+import { digBlockVerified } from "../bot/dig-verifier.js";
 /** All door types — any wood's door works interchangeably */
 const DOOR_TYPES = [
   "oak_door",
@@ -164,7 +165,7 @@ export const buildHouseSkill = defineSkill({
             safeGoto(bot, new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2), 15_000),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error("pathfinder timeout")), 15_000)),
           ]);
-          await bot.dig(block);
+          await digBlockVerified(bot, block);
           mined++;
           // Walk over the drop — digging alone leaves the log on the ground
           await collectNearbyDrops(bot, 6, 5000);

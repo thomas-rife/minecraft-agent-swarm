@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
+import { digBlockVerified } from "../bot/dig-verifier.js";
 import type { SkillResult } from "./types.js";
 import { defineSkill } from "./define.js";
 import { Vec3 } from "vec3";
@@ -434,19 +435,7 @@ async function gotoT(bot: Bot, goal: InstanceType<typeof goals.GoalNear>, ms = 1
 
 /** bot.dig with a hard timeout (see gotoT). */
 async function digT(bot: Bot, block: import("prismarine-block").Block): Promise<void> {
-  await Promise.race([
-    bot.dig(block),
-    new Promise<void>((_, rej) =>
-      setTimeout(() => {
-        try {
-          bot.stopDigging();
-        } catch {
-          /* wasn't digging */
-        }
-        rej(new Error("dig timeout"));
-      }, 12000),
-    ),
-  ]);
+  await digBlockVerified(bot, block);
 }
 
 /** bot.craft with a hard timeout (see gotoT) — table interaction can stall. */

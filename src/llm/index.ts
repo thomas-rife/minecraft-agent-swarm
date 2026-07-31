@@ -201,6 +201,13 @@ function parseDecision(
 
   const parsed = JSON.parse(jsonStr);
 
+  // Strategic output expresses durable intent only. A deterministic router
+  // chooses the high-level capability and all prerequisite leaves.
+  if (!parsed.action && parsed.goal) {
+    parsed.action = "pursue_goal";
+    parsed.params = {};
+  }
+
   // Repair malformed format: {"invoke_skill": "name"} etc.
   if (!parsed.action) {
     if (parsed.invoke_skill !== undefined) {

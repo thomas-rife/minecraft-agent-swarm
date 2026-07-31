@@ -1,6 +1,8 @@
 import type { Bot } from "mineflayer";
 import type { OperationResult } from "../operations/types.js";
 import { getSharedStructure } from "../world/registry.js";
+import { routeOverallGoal } from "./goal-router.js";
+import { houseBlueprint } from "../skills/blueprints/house.js";
 
 export interface PlannedDecision {
   thought: string;
@@ -85,9 +87,166 @@ function step(
     thought: `[plan] ${reason}`,
     action,
     params,
+    goal: objective.goal,
     completesObjective,
     objectiveAction: objective.action,
   };
+}
+
+const HOUSE_PLANK_TARGET =
+  Object.entries(houseBlueprint.materials)
+    .filter(([name]) => name.endsWith("_planks"))
+    .reduce((total, [, amount]) => total + amount, 0) + 14;
+
+function firstPlank(bot: Bot): string | undefined {
+  return bot.inventory.items().find((item) => item.name.endsWith("_planks"))?.name;
+}
+
+function canonicalCraftItem(item: string, bot: Bot): string {
+  if (["plank", "planks", "wooden_planks", "wood_planks"].includes(item)) {
+    return firstLog(bot)?.replace("_log", "_planks") ?? firstPlank(bot) ?? "oak_planks";
+  }
+  if (item === "sticks") return "stick";
+  return item;
+}
+
+interface RecipeDependency {
+  inputs: Record<string, number>;
+  yields: number;
+  table?: boolean;
+}
+
+const RECIPE_DEPENDENCIES: Record<string, RecipeDependency> = {
+  stick: { inputs: { planks: 2 }, yields: 4 },
+  crafting_table: { inputs: { planks: 4 }, yields: 1 },
+  chest: { inputs: { planks: 8 }, yields: 1, table: true },
+  torch: { inputs: { stick: 1, coal: 1 }, yields: 4 },
+  wooden_hoe: { inputs: { planks: 2, stick: 2 }, yields: 1, table: true },
+  wooden_pickaxe: { inputs: { planks: 3, stick: 2 }, yields: 1, table: true },
+  wooden_axe: { inputs: { planks: 3, stick: 2 }, yields: 1, table: true },
+  wooden_shovel: { inputs: { planks: 1, stick: 2 }, yields: 1, table: true },
+  wooden_sword: { inputs: { planks: 2, stick: 1 }, yields: 1, table: true },
+  furnace: { inputs: { cobblestone: 8 }, yields: 1, table: true },
+  stone_pickaxe: { inputs: { cobblestone: 3, stick: 2 }, yields: 1, table: true },
+  iron_pickaxe: { inputs: { iron_ingot: 3, stick: 2 }, yields: 1, table: true },
+  fishing_rod: { inputs: { stick: 3, string: 2 }, yields: 1, table: true },
+  white_bed: { inputs: { planks: 3, white_wool: 3 }, yields: 1, table: true },
+  oak_door: { inputs: { planks: 6 }, yields: 3, table: true },
+};
+
+function hasCraftingTable(bot: Bot): boolean {
+  return (
+    countNamed(bot, "crafting_table") > 0 ||
+    !!bot.findBlock?.({ matching: (block: any) => block.name === "crafting_table", maxDistance: 32 })
+  );
+}
+
+function woodCost(item: string, amount: number, bot: Bot): number {
+  const canonical = canonicalCraftItem(item, bot);
+  if (countNamed(bot, canonical) >= amount) return 0;
+  if (canonical.endsWith("_planks") || canonical === "planks") return amount;
+  const recipe = RECIPE_DEPENDENCIES[canonical];
+  if (!recipe) return 0;
+  const crafts = Math.ceil((amount - countNamed(bot, canonical)) / recipe.yields);
+  let total = Object.entries(recipe.inputs).reduce(
+    (sum, [input, count]) => sum + woodCost(input, count * crafts, bot),
+    0,
+  );
+  if (recipe.table && !hasCraftingTable(bot)) total += woodCost("crafting_table", 1, bot);
+  return total;
+}
+
+function objectiveRequirements(objective: Objective): Record<string, number> {
+  switch (objective.action) {
+    case "craft":
+      return {
+        [String(objective.params.item ?? "")]: Math.max(1, Number(objective.params.count) || 1),
+      };
+    case "build_farm":
+      return { wooden_hoe: 1 };
+    case "setup_stash":
+      return { chest: 2 };
+    case "build_house":
+      return { ...houseBlueprint.materials };
+    case "build_bridge":
+      return { planks: 3 };
+    case "light_area":
+      return { torch: 16 };
+    case "craft_gear":
+      return { wooden_pickaxe: 1, wooden_axe: 1, wooden_shovel: 1, wooden_sword: 1 };
+    case "strip_mine":
+      return { wooden_pickaxe: 1, torch: 4, planks: 8 };
+    case "go_fishing":
+      return { fishing_rod: 1 };
+    case "smelt_ores":
+      return { furnace: 1, coal: 1 };
+    case "place_block":
+      return { [String(objective.params.blockType ?? objective.params.item ?? "oak_planks")]: 1 };
+    case "mine_block": {
+      const block = String(objective.params.blockType ?? "");
+      if (/(diamond|redstone|gold)_ore/.test(block)) return { iron_pickaxe: 1 };
+      if (/(iron|copper)_ore/.test(block)) return { stone_pickaxe: 1 };
+      if (/(stone|coal_ore)/.test(block)) return { wooden_pickaxe: 1 };
+      return {};
+    }
+    case "sleep":
+    case "sleep_in_bed":
+    case "use_bed":
+      return { white_bed: 1 };
+    default:
+      return {};
+  }
+}
+
+function materialStep(objective: Objective, bot: Bot, item: string, amount: number): PlannedStep | null {
+  const canonical = canonicalCraftItem(item, bot);
+  const have = countNamed(bot, canonical);
+  if (have >= amount) return null;
+
+  if (canonical.endsWith("_planks")) {
+    const log = firstLog(bot);
+    if (!log) {
+      return step(objective, "gather_wood", { count: Math.max(1, Math.ceil((amount - have) / 4)) }, "planks require logs; harvest and verify complete trees");
+    }
+    return step(objective, "craft", { item: log.replace("_log", "_planks"), count: Math.max(1, Math.ceil((amount - have) / 4)) }, "convert verified logs into planks");
+  }
+
+  const recipe = RECIPE_DEPENDENCIES[canonical];
+  if (recipe) {
+    if (recipe.table && !hasCraftingTable(bot)) {
+      const tableStep = materialStep(objective, bot, "crafting_table", 1);
+      if (tableStep) return tableStep;
+      return step(objective, "place_block", { blockType: "crafting_table" }, "place the required crafting table");
+    }
+    const crafts = Math.ceil((amount - have) / recipe.yields);
+    for (const [input, perCraft] of Object.entries(recipe.inputs)) {
+      const dependency = materialStep(objective, bot, input, perCraft * crafts);
+      if (dependency) return dependency;
+    }
+    return step(objective, "craft", { item: canonical, count: crafts }, `craft required ${canonical}`);
+  }
+
+  const mineSource: Record<string, string> = {
+    coal: "coal_ore",
+    cobblestone: "stone",
+    iron_ingot: "iron_ore",
+    string: "cobweb",
+    white_wool: "white_wool",
+  };
+  if (mineSource[canonical]) {
+    const toolForRaw: Record<string, string> = {
+      coal: "wooden_pickaxe",
+      cobblestone: "wooden_pickaxe",
+      iron_ingot: "stone_pickaxe",
+    };
+    const tool = toolForRaw[canonical];
+    if (tool && countNamed(bot, tool) < 1) {
+      const toolStep = materialStep(objective, bot, tool, 1);
+      if (toolStep) return toolStep;
+    }
+    return step(objective, "mine_block", { blockType: mineSource[canonical], count: amount - have }, `acquire required ${canonical}`);
+  }
+  return null;
 }
 
 /**
@@ -104,9 +263,13 @@ export class ObjectivePlanner {
   }
 
   enqueue(decision: PlannedDecision, front = false): void {
+    const routed =
+      decision.action === "pursue_goal"
+        ? routeOverallGoal(decision.goal ?? decision.thought)
+        : { action: decision.action, params: decision.params ?? {} };
     const objective: Objective = {
-      action: decision.action,
-      params: { ...(decision.params ?? {}) },
+      action: routed.action,
+      params: { ...routed.params },
       goal: decision.goal,
       attempts: 0,
       noProgress: 0,
@@ -136,13 +299,96 @@ export class ObjectivePlanner {
     while (this.queue.length > 0) {
       const objective = this.queue[0];
 
+      const requirements = objectiveRequirements(objective);
+      const woodNeeded = Object.entries(requirements).reduce(
+        (total, [item, amount]) => total + woodCost(item, amount, bot),
+        0,
+      );
+      if (woodEquivalent(bot) < woodNeeded) {
+        this.inFlight = step(
+          objective,
+          "gather_wood",
+          { count: Math.ceil((woodNeeded - woodEquivalent(bot)) / 4) },
+          "gather the complete wood budget for the whole dependency tree",
+        );
+        return this.inFlight;
+      }
+      for (const [item, amount] of Object.entries(requirements)) {
+        const dependency = materialStep(objective, bot, item, amount);
+        if (dependency) {
+          if (
+            objective.action === "craft" &&
+            dependency.action === "craft" &&
+            canonicalCraftItem(String(dependency.params.item), bot) === canonicalCraftItem(item, bot)
+          ) dependency.completesObjective = true;
+          this.inFlight = dependency;
+          return this.inFlight;
+        }
+      }
+
+      if (objective.action === "craft") {
+        const item = canonicalCraftItem(String(objective.params.item ?? ""), bot);
+        const wanted = Math.max(1, Number(objective.params.count) || 1);
+        objective.params.item = item;
+        if (countNamed(bot, item) >= wanted) {
+          this.queue.shift();
+          continue;
+        }
+        const dependency = materialStep(objective, bot, item, wanted);
+        if (dependency) {
+          dependency.completesObjective = dependency.action === "craft" && dependency.params.item === item;
+          this.inFlight = dependency;
+          return this.inFlight;
+        }
+      }
+
+      if (objective.action === "build_farm") {
+        const hasHoe = bot.inventory.items().some((item) => item.name.endsWith("_hoe"));
+        if (!hasHoe) {
+          const dependency = materialStep(objective, bot, "wooden_hoe", 1);
+          if (dependency) {
+            this.inFlight = dependency;
+            return this.inFlight;
+          }
+        }
+        this.inFlight = step(objective, "build_farm", objective.params, "tool chain verified; establish and plant the farm", true);
+        return this.inFlight;
+      }
+
+      if (objective.action === "build_bridge" && reserveBlocks(bot) < 3) {
+        const dependency = materialStep(objective, bot, "planks", 3);
+        if (dependency) {
+          this.inFlight = dependency;
+          return this.inFlight;
+        }
+      }
+
+      if (objective.action === "light_area" && countNamed(bot, "torch") < 16) {
+        const dependency = materialStep(objective, bot, "torch", 16);
+        if (dependency) {
+          this.inFlight = dependency;
+          return this.inFlight;
+        }
+      }
+
+      if (objective.action === "craft_gear" && !bot.inventory.items().some((item) => item.name.endsWith("_pickaxe"))) {
+        const dependency = materialStep(objective, bot, "wooden_pickaxe", 1);
+        if (dependency) {
+          this.inFlight = dependency;
+          return this.inFlight;
+        }
+      }
+
       if (objective.action === "setup_stash") {
         if (getSharedStructure("shared-stash")?.status === "verified") {
           this.queue.shift();
           continue;
         }
         // Two chests cost 16 planks and a new crafting table costs four more.
-        const deficit = Math.max(0, 20 - woodEquivalent(bot));
+        const chestsHeld = countNamed(bot, "chest");
+        const deficit = chestsHeld >= 2
+          ? 0
+          : Math.max(0, 20 - woodEquivalent(bot));
         if (deficit > 0) {
           this.inFlight = step(
             objective,

@@ -220,7 +220,7 @@ async function main(): Promise<void> {
     const role = BOT_ROSTER[index];
     console.log(`[Main] Starting ${role.name} (${role.role})...`);
     loops.push(runBotLoop(role));
-    if (index < count - 1) await new Promise((resolve) => setTimeout(resolve, 10_000));
+    if (index < count - 1) await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
 
   try {

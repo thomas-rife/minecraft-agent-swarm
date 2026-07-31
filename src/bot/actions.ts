@@ -17,6 +17,7 @@ import { safeMoves, explorerMoves, safeGoto, collectNearbyDrops } from "./naviga
 import { runControlledOperation } from "../operations/controller.js";
 import { failed, operationResult, succeeded, type OperationResult } from "../operations/types.js";
 import { verifyAtPosition, verifyDryStable } from "../verification/world-verifiers.js";
+import { digBlockVerified } from "./dig-verifier.js";
 export { safeMoves, explorerMoves, safeGoto, collectNearbyDrops };
 
 /** Hard cap for a single DIRECT action. Longer than any legit action (gather
@@ -107,6 +108,20 @@ function itemCount(bot: Bot, name: string): number {
     .reduce((total, item) => total + item.count, 0);
 }
 
+function requestedItemCount(items: Iterable<{ name: string; count: number }>, requested: string): number {
+  const plankAlias = ["plank", "planks", "wooden_planks", "wood_planks"].includes(requested);
+  const logAlias = ["log", "logs", "wood"].includes(requested);
+  let total = 0;
+  for (const item of items) {
+    if (
+      item.name === requested ||
+      (plankAlias && item.name.endsWith("_planks")) ||
+      (logAlias && item.name.endsWith("_log"))
+    ) total += item.count;
+  }
+  return total;
+}
+
 async function verifyDirectAction(
   bot: Bot,
   action: string,
@@ -144,7 +159,8 @@ async function verifyDirectAction(
       : failed("STILL_UNSAFE", message, { postconditions: [dry], retryable: true });
   }
   if (action === "craft" && typeof params.item === "string") {
-    const delta = itemCount(bot, params.item) - (before.inventory.get(params.item) ?? 0);
+    const beforeItems = [...before.inventory].map(([name, count]) => ({ name, count }));
+    const delta = requestedItemCount(bot.inventory.items(), params.item) - requestedItemCount(beforeItems, params.item);
     const postcondition = { name: `inventory_increased:${params.item}`, satisfied: delta > 0, evidence: { delta } };
     return delta > 0
       ? succeeded("ITEM_CRAFTED", message, { postconditions: [postcondition] })
@@ -161,7 +177,10 @@ async function verifyDirectAction(
       ? succeeded("FOOD_CONSUMED", message, { postconditions: [postcondition] })
       : failed("EAT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
   }
-  if (["explore", "gather_wood", "mine_block", "place_block", "build_shelter"].includes(action)) {
+  if (action === "mine_block") {
+    return succeeded("TARGET_BLOCK_BREAK_VERIFIED", message);
+  }
+  if (["explore", "gather_wood", "place_block", "build_shelter"].includes(action)) {
     const moved = bot.entity.position.distanceTo(before.position) > 1;
     const inventoryChanged = bot.inventory
       .items()
@@ -472,7 +491,6 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
     // trunk-tops hovering over air everywhere, and they bait the finder into
     // unreachable targets (evidence: base at y=82 with the bot directly
     // below at y=74). A real trunk base sits on a solid block.
-    if (!below || below.name === "air" || below.name === "water") continue;
 
     tried++;
     try {
@@ -525,42 +543,9 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
         // logs outside normal reach instead of abandoning the trunk top.
         for (const logPos of treeLogs) {
           if (logPos.equals(basePos)) continue;
-          let treeLog = bot.blockAt(logPos);
-          if (!treeLog || !logTypes.includes(treeLog.name)) continue;
-          try {
-            if (bot.entity.position.distanceTo(logPos) > 4.3) {
-              const treeMoves = new Movements(bot);
-              treeMoves.canDig = true;
-              treeMoves.allow1by1towers = bot.inventory
-                .items()
-                .some((item) => item.name.endsWith("_planks") || ["dirt", "cobblestone", "stone"].includes(item.name));
-              treeMoves.maxDropDown = 2;
-              treeMoves.allowParkour = false;
-              bot.pathfinder.setMovements(treeMoves);
-              await safeGoto(bot, new goals.GoalNear(logPos.x, logPos.y, logPos.z, 3), 15000, 4000);
-              treeLog = bot.blockAt(logPos);
-              if (!treeLog || !logTypes.includes(treeLog.name)) continue;
-            }
-            await digSafe(bot, treeLog);
-            gathered++;
-          } catch {
-            // Continue with the other connected logs.
-          }
+          await breakTreeLogVerified(bot, logPos, logTypes);
+          gathered++;
         }
-        let above: import("prismarine-block").Block | null = null;
-        let felled = 0;
-        // Cap 12, not 6: a 6-cap left the tops of tall oaks floating, and those
-        // remnants are exactly what poisons the finder (see count comment above).
-        while (above && (logTypes as readonly string[]).includes(above.name) && felled < 12) {
-          try {
-            await digSafe(bot, above);
-            felled++;
-          } catch {
-            break; // out of dig reach — the rest of the trunk stays
-          }
-          above = bot.blockAt(above.position.offset(0, 1, 0));
-        }
-        gathered += felled;
         chopSpots.push(basePos.clone()); // remember the trunk spot to replant on
         // Walk over the drops — digging alone leaves the items on the ground
         await new Promise((r) => setTimeout(r, 600));
@@ -754,6 +739,50 @@ function blockMatcher(blockType: string): { match: (name: string) => boolean; is
 /** Discover a whole tree before the base is removed. Twenty-six-neighbour
  * connectivity includes branched/diagonal oak trunks while the cap prevents
  * touching canopies from turning into an unbounded forest operation. */
+async function breakTreeLogVerified(bot: Bot, position: Vec3, logTypes: readonly string[]): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const block = bot.blockAt(position);
+    if (!block || !logTypes.includes(block.name)) return;
+    try {
+      if (bot.entity.position.distanceTo(position) > 4.3 || !bot.canDigBlock(block)) {
+        await collectNearbyDrops(bot, 4, 2500);
+        const moves = new Movements(bot);
+        moves.canDig = true;
+        const scaffold = bot.inventory
+          .items()
+          .filter(
+            (item) =>
+              item.name.endsWith("_planks") ||
+              item.name.endsWith("_log") ||
+              ["dirt", "cobblestone", "stone"].includes(item.name),
+          )
+          .map((item) => item.type);
+        moves.allow1by1towers = scaffold.length > 0;
+        moves.scafoldingBlocks = scaffold;
+        moves.maxDropDown = 2;
+        moves.allowParkour = false;
+        bot.pathfinder.setMovements(moves);
+        await safeGoto(bot, new goals.GoalNear(position.x, position.y, position.z, 3), 15000, 4000);
+      }
+      const fresh = bot.blockAt(position);
+      if (!fresh || !logTypes.includes(fresh.name)) return;
+      if (!bot.canDigBlock(fresh)) throw new Error("TREE_LOG_OUT_OF_REACH");
+      await digBlockVerified(bot, fresh);
+      await collectNearbyDrops(bot, 4, 2500);
+      return;
+    } catch (error) {
+      lastError = error;
+      try {
+        bot.pathfinder.stop();
+      } catch {
+        // Retry the same exact block from fresh world state.
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("TREE_LOG_NOT_BROKEN");
+}
+
 function connectedTreeLogs(bot: Bot, start: Vec3, logTypes: readonly string[], cap: number): Vec3[] {
   const queue = [start.clone()];
   const result: Vec3[] = [];
@@ -785,19 +814,7 @@ function connectedTreeLogs(bot: Bot, start: Vec3, logTypes: readonly string[], c
 }
 
 async function digSafe(bot: Bot, block: import("prismarine-block").Block): Promise<void> {
-  await Promise.race([
-    bot.dig(block),
-    new Promise<void>((_, rej) =>
-      setTimeout(() => {
-        try {
-          bot.stopDigging();
-        } catch {
-          /* wasn't digging */
-        }
-        rej(new Error("dig timeout"));
-      }, 12000),
-    ),
-  ]);
+  await digBlockVerified(bot, block);
 }
 
 async function mineBlock(

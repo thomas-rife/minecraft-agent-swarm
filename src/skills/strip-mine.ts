@@ -7,6 +7,7 @@ import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
 import { partial } from "../operations/types.js";
 import { verifyAtPosition } from "../verification/world-verifiers.js";
 import { upsertSharedStructure } from "../world/registry.js";
+import { digBlockVerified } from "../bot/dig-verifier.js";
 
 const TUNNEL_LENGTH = 40;
 const TORCH_INTERVAL = 6;
@@ -256,19 +257,7 @@ async function equipBestPickaxe(bot: Bot): Promise<void> {
  * Fail fast (12s) and move on instead.
  */
 async function digSafe(bot: Bot, b: import("prismarine-block").Block): Promise<void> {
-  await Promise.race([
-    bot.dig(b),
-    new Promise<void>((_, rej) =>
-      setTimeout(() => {
-        try {
-          bot.stopDigging();
-        } catch {
-          /* not digging */
-        }
-        rej(new Error("dig timeout"));
-      }, 12000),
-    ),
-  ]);
+  await digBlockVerified(bot, b);
 }
 
 /**

@@ -3,6 +3,7 @@ import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { collectNearbyDrops } from "../bot/navigation.js";
+import { digBlockVerified } from "../bot/dig-verifier.js";
 
 /** Crafting dependency tree: item → { inputs needed, yield per craft } */
 const CRAFT_TREE: Record<string, { inputs: Record<string, number>; yields: number }> = {
@@ -214,7 +215,7 @@ export async function gatherMaterials(
           new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2),
           signal,
         );
-        await bot.dig(block);
+        await digBlockVerified(bot, block);
         gathered++;
         // Walk over the drop — digging alone leaves the item on the ground
         await new Promise((r) => setTimeout(r, 400));
