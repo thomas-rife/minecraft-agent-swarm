@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { LlmQueueWaitTimeoutError, SerialTaskQueue } from "./scheduler.js";
+import { LlmQueueWaitTimeoutError, queueWaitLimitFor, SerialTaskQueue } from "./scheduler.js";
 
 test("local LLM tasks run one at a time in arrival order", async () => {
   const queue = new SerialTaskQueue();
@@ -59,4 +59,10 @@ test("a stale queued LLM task rejects before the running request completes", asy
   assert.equal(secondRan, false);
   releaseFirst();
   await first;
+});
+
+test("strategic plans wait for the serialized local model instead of timing out in a retry loop", () => {
+  assert.equal(queueWaitLimitFor("strategic", 15_000), undefined);
+  assert.equal(queueWaitLimitFor("reactive", 15_000), 5_000);
+  assert.equal(queueWaitLimitFor("critic", 15_000), 15_000);
 });

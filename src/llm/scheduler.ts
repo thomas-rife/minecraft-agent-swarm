@@ -6,6 +6,14 @@ export class LlmQueueWaitTimeoutError extends Error {
   }
 }
 
+/** Strategic plans remain useful while waiting for the single local model.
+ * Urgent reactions expire quickly; optional limits still apply to auxiliary calls. */
+export function queueWaitLimitFor(label: string, configuredMaxMs: number): number | undefined {
+  if (label === "strategic") return undefined;
+  if (label === "reactive") return Math.min(5_000, configuredMaxMs > 0 ? configuredMaxMs : 5_000);
+  return configuredMaxMs > 0 ? configuredMaxMs : undefined;
+}
+
 export class SerialTaskQueue {
   private tail: Promise<void> = Promise.resolve();
 

@@ -12,7 +12,7 @@ import {
 } from "./prompts.js";
 import { createLogger } from "../util/logger.js";
 import { recordLlmResponse } from "../bot/scoreboard.js";
-import { localLlmQueue } from "./scheduler.js";
+import { localLlmQueue, queueWaitLimitFor } from "./scheduler.js";
 import { nonStreamingChatPayload } from "./transport.js";
 
 /** Model-aware think option. qwen3.6 needs think:false (it otherwise burns the
@@ -40,8 +40,7 @@ async function chatTimed(
   request: Parameters<Ollama["chat"]>[0],
   timeoutMs = config.ollama.requestTimeoutMs,
 ): Promise<any> {
-  const maxQueueWaitMs =
-    label === "reactive" ? Math.min(5_000, config.ollama.maxQueueWaitMs) : config.ollama.maxQueueWaitMs;
+  const maxQueueWaitMs = queueWaitLimitFor(label, config.ollama.maxQueueWaitMs);
   return localLlmQueue.run(
     async (queueWaitMs) => {
       if (queueWaitMs >= 1_000) {
