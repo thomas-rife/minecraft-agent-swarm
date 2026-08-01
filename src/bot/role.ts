@@ -48,7 +48,29 @@ export const ALL_STATIC_SKILLS = [
   "setup_stash",
 ] as const;
 
-const withUniversalCapabilities = (actions: string[]) => [...new Set([...actions, "neural_combat"])] as string[];
+/** Every executable built-in action is available to every bot. Roles influence
+ * priorities and personality only; they are never permission boundaries. */
+export const ALL_ACTIONS = [
+  "explore",
+  "go_to",
+  "gather_wood",
+  "mine_block",
+  "craft",
+  "eat",
+  "sleep",
+  "flee",
+  "attack",
+  "build_shelter",
+  "place_block",
+  "idle",
+  "neural_combat",
+  "neural_navigation",
+  "give_item",
+  "deposit_stash",
+  "withdraw_stash",
+  "invoke_skill",
+  "generate_skill",
+] as const;
 
 /** Milo scouts, explores, and guards the team. */
 export const MILO_CONFIG: BotRoleConfig = {
@@ -63,16 +85,7 @@ export const MILO_CONFIG: BotRoleConfig = {
   leashRadius: 500,
   stashPos: STASH_POS,
   safeSpawn: HOME_BASE,
-  allowedActions: withUniversalCapabilities([
-    "explore",
-    "go_to",
-    "gather_wood",
-    "mine_block",
-    "eat",
-    "sleep",
-    "flee",
-    "attack",
-  ]),
+  allowedActions: [...ALL_ACTIONS],
   allowedSkills: [...ALL_STATIC_SKILLS],
   keepItems: [
     { name: "sapling", minCount: 16 },
@@ -103,7 +116,7 @@ export const AVA_CONFIG: BotRoleConfig = {
   leashRadius: 150,
   stashPos: STASH_POS,
   safeSpawn: HOME_BASE,
-  allowedActions: withUniversalCapabilities(["craft", "eat", "sleep", "go_to", "place_block", "flee"]),
+  allowedActions: [...ALL_ACTIONS],
   allowedSkills: [...ALL_STATIC_SKILLS],
   keepItems: [
     { name: "hoe", minCount: 1 },
@@ -133,16 +146,7 @@ export const PETER_CONFIG: BotRoleConfig = {
   leashRadius: 250,
   stashPos: STASH_POS,
   safeSpawn: HOME_BASE,
-  allowedActions: withUniversalCapabilities([
-    "mine_block",
-    "gather_wood",
-    "go_to",
-    "place_block",
-    "eat",
-    "sleep",
-    "craft",
-    "flee",
-  ]),
+  allowedActions: [...ALL_ACTIONS],
   allowedSkills: [...ALL_STATIC_SKILLS],
   keepItems: [
     { name: "sapling", minCount: 16 },

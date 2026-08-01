@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ALL_STATIC_SKILLS, BOT_ROSTER, HOME_BASE, STASH_POS } from "./role.js";
+import { ALL_ACTIONS, ALL_STATIC_SKILLS, BOT_ROSTER, HOME_BASE, STASH_POS } from "./role.js";
 
 test("the swarm has exactly Milo, Ava, and Peter", () => {
   assert.deepEqual(BOT_ROSTER.map((role) => role.name), ["Milo", "Ava", "Peter"]);
@@ -17,9 +17,9 @@ test("all bots share only the configured home and stash anchor", () => {
   }
 });
 
-test("every role can invoke every verified static skill", () => {
+test("roles affect priorities, not action or skill permissions", () => {
   for (const role of BOT_ROSTER) {
-    assert.deepEqual(new Set(role.allowedSkills), new Set(ALL_STATIC_SKILLS), role.name);
-    assert.ok(role.allowedActions.includes("neural_combat"), `${role.name} lacks neural_combat`);
+    assert.deepEqual(new Set(role.allowedActions), new Set(ALL_ACTIONS), `${role.name} has restricted actions`);
+    assert.deepEqual(new Set(role.allowedSkills), new Set(ALL_STATIC_SKILLS), `${role.name} has restricted skills`);
   }
 });
