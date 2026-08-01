@@ -109,6 +109,7 @@ export class BotMemoryStore {
   // on every load so a fixed version gets a fresh chance each session.
   // Dynamic/Voyager skills have no developer fix path, so they stay permanently blocked.
   private static readonly STATIC_SKILL_NAMES = new Set([
+    "setup_stash",
     "build_house",
     "craft_gear",
     "light_area",

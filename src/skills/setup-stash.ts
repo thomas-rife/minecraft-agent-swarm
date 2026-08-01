@@ -95,6 +95,11 @@ export const setupStashSkill = defineSkill({
     });
 
     if (existingChest) {
+      // Mineflayer can invalidate a cached Block's position while its container
+      // window is opened/closed. Snapshot the coordinates before doing that so
+      // the completion message cannot dereference a stale block object.
+      const existingChestPosition = snapshotBlockPosition(existingChest.position, stashPos);
+
       // A stash exists — check whether it still has room. If it's full,
       // fall through and place an additional chest (stash expansion).
       let hasRoom = true;
@@ -118,7 +123,7 @@ export const setupStashSkill = defineSkill({
         });
         return {
           success: true,
-          message: `Stash already exists — chest found at ${existingChest.position.x}, ${existingChest.position.y}, ${existingChest.position.z}.`,
+          message: `Stash already exists — chest found at ${existingChestPosition.x}, ${existingChestPosition.y}, ${existingChestPosition.z}.`,
         };
       }
       onProgress({
@@ -445,6 +450,14 @@ async function ensureCraftingTable(bot: Bot, signal: AbortSignal): Promise<void>
       }
     }
   }
+}
+
+export function snapshotBlockPosition(
+  position: { x: number; y: number; z: number } | null | undefined,
+  fallback: { x: number; y: number; z: number },
+): { x: number; y: number; z: number } {
+  const source = position ?? fallback;
+  return { x: source.x, y: source.y, z: source.z };
 }
 
 export function stashPlacementOffsets(radius: number): Array<{ dx: number; dz: number }> {
