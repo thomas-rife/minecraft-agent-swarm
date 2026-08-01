@@ -11,7 +11,7 @@ if (config.bot.dynamicSkillsEnabled) loadDynamicSkills();
 const activeStops: (() => void)[] = [];
 let shuttingDown = false;
 
-function shutdownAll(signal = "shutdown"): void {
+function shutdownAll(signal = "shutdown", exitCode = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("\n[Main] Shutting down all bots...");
@@ -23,8 +23,8 @@ function shutdownAll(signal = "shutdown"): void {
       // Continue shutting down the other bots.
     }
   }
-  stopDiagnosticLog(signal, 0);
-  process.exit(0);
+  stopDiagnosticLog(signal, exitCode);
+  process.exit(exitCode);
 }
 
 process.on("SIGINT", () => shutdownAll("SIGINT"));
@@ -51,7 +51,8 @@ process.on("uncaughtException", (error) => {
     message: error.message || String(error),
     details: error,
   });
-  console.error("[Main] Uncaught exception (non-fatal; process kept alive):", error.message || error);
+  console.error("[Main] Uncaught exception; shutting down for supervisor restart:", error.message || error);
+  setImmediate(() => shutdownAll("uncaughtException", 1));
 });
 
 async function startBot(

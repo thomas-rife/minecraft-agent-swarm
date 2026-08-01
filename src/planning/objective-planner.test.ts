@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ObjectivePlanner } from "./objective-planner.js";
+import { failed } from "../operations/types.js";
 import { resetSharedWorldRegistry, upsertSharedStructure } from "../world/registry.js";
 
 function botWith(items: Array<{ name: string; count: number }> = [], food = 20) {
@@ -44,6 +45,33 @@ test("an empty verified stash falls back to local resource acquisition", () => {
   const next = planner.next(botWith());
   assert.equal(next?.action, "gather_wood");
   assert.equal(next?.params.count, 4);
+});
+
+test("a rejected deterministic leaf releases the planner for another step", () => {
+  resetSharedWorldRegistry();
+  const planner = new ObjectivePlanner();
+  planner.enqueue({ thought: "", action: "gather_wood", params: { count: 2 } });
+
+  assert.equal(planner.next(botWith())?.action, "gather_wood");
+  assert.equal(planner.hasInFlight(), true);
+
+  planner.record(failed("PLANNER_STEP_NOT_EXECUTED", "gated before execution", { retryable: true }));
+  assert.equal(planner.hasInFlight(), false);
+  assert.equal(planner.next(botWith())?.action, "gather_wood");
+});
+
+test("completed craft_gear dependencies finish without invoking the skill again", () => {
+  resetSharedWorldRegistry();
+  const planner = new ObjectivePlanner();
+  planner.enqueue({ thought: "", action: "craft_gear", params: {} });
+  const tools = ["wooden_pickaxe", "wooden_axe", "wooden_shovel", "wooden_sword"].map((name) => ({
+    name,
+    count: 1,
+  }));
+
+  assert.equal(planner.next(botWith(tools)), null);
+  assert.equal(planner.hasWork(), false);
+  assert.equal(planner.hasInFlight(), false);
 });
 
 test("strip mining starts at the deepest raw-material prerequisite", () => {

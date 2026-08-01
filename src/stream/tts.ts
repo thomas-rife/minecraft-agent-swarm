@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUDIO_DIR = path.join(__dirname, "../../overlay/audio");
+const TTS_ENABLED = process.env.ENABLE_TTS === "true";
 
 // Ensure audio directory exists
 if (!fs.existsSync(AUDIO_DIR)) {
@@ -35,6 +36,10 @@ let audioCounter = 0;
  * Files are saved to overlay/audio/ and served via the overlay HTTP server.
  */
 export async function generateSpeech(text: string): Promise<string | null> {
+  // Edge TTS has emitted errors outside its returned promise in long runs.
+  // Keep it off unless explicitly enabled so narration cannot destabilize control.
+  if (!TTS_ENABLED || !text.trim()) return null;
+
   try {
     const tts = await getTTS();
     const filename = `thought-${++audioCounter}.mp3`;

@@ -37,7 +37,7 @@ import { recordAction, recordSkillResult, checkInventoryMilestones } from "./sco
 import { getTechTreeLine } from "./curriculum.js";
 import { recordTrajectory } from "./trajectory.js";
 import { buildStrategicPrompt } from "../llm/prompts.js";
-import type { OperationResult } from "../operations/types.js";
+import { failed, type OperationResult } from "../operations/types.js";
 import { recordDiagnosticOperation } from "../util/diagnostic-log.js";
 import { GoalManager } from "../goals/manager.js";
 import type { GoalPredicate } from "../goals/types.js";
@@ -58,7 +58,7 @@ import {
   recordTaskResult,
 } from "../coordination/task-board.js";
 import { configureStashLedgerPersistence } from "../skills/stash-ledger.js";
-import { cancelActiveOperation } from "../operations/controller.js";
+import { cancelActiveOperation, getActiveOperation } from "../operations/controller.js";
 import { ObjectivePlanner, type PlannedDecision } from "../planning/objective-planner.js";
 
 export interface ChatMessage {
@@ -106,6 +106,7 @@ export class BotBrain {
   private armorTimer: NodeJS.Timeout | null = null;
   private recoveryTimer: NodeJS.Timeout | null = null;
   private registryTimer: NodeJS.Timeout | null = null;
+  private plannerWatchdog: NodeJS.Timeout | null = null;
 
   // Decision state (migrated from the old decide() function)
   private goalManager = new GoalManager();
@@ -293,6 +294,21 @@ export class BotBrain {
     }, 45_000);
     this.registryTimer.unref?.();
 
+    // A planner leaf without a live operation is an impossible state during
+    // normal execution. Recover it instead of allowing another silent,
+    // hours-long split between strategic thoughts and Minecraft actions.
+    this.plannerWatchdog = setInterval(() => {
+      if (this.processing || !this.objectivePlanner.hasInFlight() || getActiveOperation(this.bot)) return;
+      this.log.warn("Brain", "WATCHDOG: releasing planner step with no active operation");
+      this.objectivePlanner.record(
+        failed("PLANNER_WATCHDOG_RELEASED", "Released an orphaned deterministic planner step.", {
+          retryable: true,
+        }),
+      );
+      this.triggerReplan();
+    }, 15_000);
+    this.plannerWatchdog.unref?.();
+
     // 0c. Anti-drown: ~90% of all deaths were bots drowning in the stash water
     // pit. Drowning kills in ~15s, so check often and swim out even mid-action
     // (this overrides whatever the bot is doing — staying alive comes first).
@@ -351,12 +367,14 @@ export class BotBrain {
     if (this.armorTimer) clearInterval(this.armorTimer);
     if (this.recoveryTimer) clearInterval(this.recoveryTimer);
     if (this.registryTimer) clearInterval(this.registryTimer);
+    if (this.plannerWatchdog) clearInterval(this.plannerWatchdog);
     this.idleTimer = null;
     this.hostileScanner = null;
     this.overlayInterval = null;
     this.armorTimer = null;
     this.recoveryTimer = null;
     this.registryTimer = null;
+    this.plannerWatchdog = null;
     this.eventQueue.length = 0;
     this.objectivePlanner.clear();
     void cancelActiveOperation(this.bot);
@@ -713,8 +731,10 @@ export class BotBrain {
       const next = this.objectivePlanner.next(this.bot);
       if (next) {
         await this.executeDecision(next, "deterministic");
-        return;
       }
+      // A queued deterministic plan owns progression. Never spend another LLM
+      // call or append more objectives merely because a step is in flight.
+      return;
     }
 
     // Survival override: starvation was killing the team (whole roster at
@@ -960,6 +980,34 @@ export class BotBrain {
   }
 
   private async executeDecision(
+    decision: {
+      thought: string;
+      action: string;
+      params: Record<string, any>;
+      goal?: string;
+      goalSteps?: number;
+      objectiveAction?: string;
+      completesObjective?: boolean;
+    },
+    scope: "strategic" | "reactive" | "critic" | "deterministic" = "strategic",
+  ): Promise<void> {
+    try {
+      await this.executeDecisionInner(decision, scope);
+    } finally {
+      // Every deterministic leaf must settle, including role/blacklist gates
+      // and exceptions that happen before executeAction().
+      if (scope === "deterministic" && this.objectivePlanner.hasInFlight()) {
+        this.objectivePlanner.record(
+          failed("PLANNER_STEP_NOT_EXECUTED", `Planner step ${decision.action} did not reach execution.`, {
+            retryable: true,
+          }),
+        );
+        setTimeout(() => this.triggerReplan(), 500);
+      }
+    }
+  }
+
+  private async executeDecisionInner(
     decision: {
       thought: string;
       action: string;

@@ -262,6 +262,10 @@ export class ObjectivePlanner {
     return this.queue.length > 0;
   }
 
+  hasInFlight(): boolean {
+    return this.inFlight !== null;
+  }
+
   enqueue(decision: PlannedDecision, front = false): void {
     const routed =
       decision.action === "pursue_goal"
@@ -324,6 +328,15 @@ export class ObjectivePlanner {
           this.inFlight = dependency;
           return this.inFlight;
         }
+      }
+
+      // The dependency tree is itself the objective for craft_gear. Once all
+      // required tools are present, invoking the skill again can only produce
+      // the contradictory "Missing: none" failure that used to trap the
+      // planner in a retry/blacklist loop.
+      if (objective.action === "craft_gear" && Object.keys(requirements).length > 0) {
+        this.queue.shift();
+        continue;
       }
 
       if (objective.action === "craft") {

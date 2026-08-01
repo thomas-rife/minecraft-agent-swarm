@@ -318,11 +318,19 @@ export const craftGearSkill = defineSkill({
     const newlyCrafted = crafted.filter((c) => !c.includes("already had"));
 
     if (crafted.length === 0 || newlyCrafted.length === 0) {
-      // No new tools made — report what's missing so the LLM knows to get materials
-      const missing = TOOL_TYPES.map((t) => {
-        const have = bot.inventory.items().find((i) => i.name.endsWith(`_${t}`));
-        return have ? null : t;
-      }).filter(Boolean);
+      const missing = TOOL_TYPES.filter(
+        (type) => !bot.inventory.items().some((item) => item.name.endsWith(`_${type}`)),
+      );
+      if (missing.length === 0) {
+        return {
+          success: true,
+          message: "Gear already complete. All required tools are present.",
+          stats: { toolsCrafted: 0 },
+        };
+      }
+
+      // No new tools made — report what's actually missing. Never emit the
+      // contradictory "Missing: none" failure.
       const hasWood = bot.inventory.items().some((i) => i.name.endsWith("_log") || i.name.endsWith("_planks"));
       const hasCobble = bot.inventory.items().some((i) => i.name === "cobblestone");
       const hasTable = !!bot.findBlock({ matching: (b) => b.name === "crafting_table", maxDistance: 32 });
@@ -332,7 +340,7 @@ export const craftGearSkill = defineSkill({
       if (missing.includes("pickaxe") && !hasCobble) hints.push("need cobblestone for pickaxe");
       return {
         success: false,
-        message: `No new tools crafted. Missing: ${missing.join(", ") || "none"}. ${hints.join(". ")}. Use gather_wood to get materials first.`,
+        message: `No new tools crafted. Missing: ${missing.join(", ")}. ${hints.join(". ")}. Use gather_wood to get materials first.`,
       };
     }
 

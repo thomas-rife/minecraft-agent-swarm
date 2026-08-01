@@ -41,6 +41,35 @@ test("water emergency clears after a stable dry observation window", async () =>
   assert.equal(manager.getActive(), null);
 });
 
+test("feet-only shallow water does not create a drowning emergency", () => {
+  const bot = dryBot();
+  bot.blockAt = (position: Vec3) => ({
+    name: position.y <= 64 ? "water" : "air",
+    boundingBox: "empty",
+  });
+  const manager = new EmergencyManager();
+
+  assert.equal(manager.observe(bot), null);
+  assert.equal(manager.getActive(), null);
+});
+
+test("persistent head submersion is bounded and enters backoff", async () => {
+  const bot = dryBot();
+  bot.blockAt = () => ({ name: "water", boundingBox: "empty" });
+  bot.waitForTicks = async () => {};
+  bot.lookAt = async () => {};
+  const manager = new EmergencyManager();
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    assert.equal(manager.observe(bot)?.kind, "WATER_ESCAPE");
+    const result = await manager.resolve(bot);
+    assert.equal(result?.code, "WATER_CONDITION_PERSISTS");
+  }
+
+  assert.equal(manager.getActive(), null);
+  assert.equal(manager.observe(bot), null);
+});
+
 test("standing still at a low Y coordinate does not create a trapped emergency", () => {
   const bot = dryBot();
   const manager = new EmergencyManager();

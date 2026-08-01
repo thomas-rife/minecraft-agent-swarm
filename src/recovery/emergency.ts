@@ -16,10 +16,13 @@ export interface EmergencyState {
 export class EmergencyManager {
   private active: EmergencyState | null = null;
   private trapRetryAfter = 0;
+  private waterRetryAfter = 0;
 
   // A failed recovery should not become a tight cancellation loop. A later
   // navigation failure can request another attempt after this backoff.
   private static readonly TRAP_RETRY_BACKOFF_MS = 30_000;
+  private static readonly MAX_WATER_ATTEMPTS = 5;
+  private static readonly WATER_EXHAUSTED_BACKOFF_MS = 30_000;
 
   getActive(): EmergencyState | null {
     return this.active;
@@ -28,7 +31,14 @@ export class EmergencyManager {
   observe(bot: Bot): EmergencyState | null {
     const now = Date.now();
     const water = waterState(bot);
-    if (!water.dry) return this.enter("WATER_ESCAPE", now);
+    // Feet-only water is ordinary swimming/wading. Drowning recovery must
+    // match escapeWaterIfDrowning(), which acts only on head submersion.
+    if (water.headInWater && now >= this.waterRetryAfter) return this.enter("WATER_ESCAPE", now);
+
+    if (this.active?.kind === "WATER_ESCAPE" && !water.headInWater) {
+      this.active = null;
+      return null;
+    }
 
     // Standing still is normal while idle, planning, crafting, or waiting for
     // another bot. Only navigation's own progress detector has enough context
@@ -38,7 +48,6 @@ export class EmergencyManager {
       return this.enter("TRAPPED", now);
     }
 
-    if (this.active?.kind === "WATER_ESCAPE" && water.dry) return this.active;
     return this.active;
   }
 
@@ -72,7 +81,13 @@ export class EmergencyManager {
               observations: waterState(bot),
             });
       });
-      if (result.status === "succeeded") this.active = null;
+      if (result.status === "succeeded") {
+        this.active = null;
+        this.waterRetryAfter = 0;
+      } else if (emergency.attempts >= EmergencyManager.MAX_WATER_ATTEMPTS) {
+        this.active = null;
+        this.waterRetryAfter = Date.now() + EmergencyManager.WATER_EXHAUSTED_BACKOFF_MS;
+      }
       return result;
     }
 
