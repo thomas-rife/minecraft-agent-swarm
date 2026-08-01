@@ -67,19 +67,26 @@ test("a verified stash requires three nearby misses before it is downgraded", as
 });
 test("stash verification tolerates approximate canonical Y coordinates", async () => {
   resetSharedWorldRegistry();
-  const chest = { name: "chest", position: { x: 1, y: 78, z: 2 } };
+  const chest: { name: string; position: { x: number; y: number; z: number } | null } = {
+    name: "chest",
+    position: { x: 1, y: 78, z: 2 },
+  };
   const bot = {
     findBlock: ({ matching }: any) => (matching(chest) ? chest : null),
     openContainer: async () => ({
       inventoryStart: 27,
       containerItems: () => [],
-      close: () => {},
+      // Reproduce Mineflayer invalidating the cached block during close.
+      close: () => {
+        chest.position = null;
+      },
     }),
   } as any;
 
   const result = await verifyCanonicalStash(bot, "shared-stash", { x: 1, y: 64, z: 2 }, 5);
   assert.equal(result.status, "verified");
-  assert.deepEqual(result.position, chest.position);
+  assert.deepEqual(result.position, { x: 1, y: 78, z: 2 });
+  assert.equal(chest.position, null);
 });
 test("a transient container-open failure cannot downgrade a verified stash", async () => {
   resetSharedWorldRegistry();

@@ -105,9 +105,14 @@ export async function verifyCanonicalStash(
       : intendedPosition;
   const point = new Vec3(anchor.x, anchor.y, anchor.z);
   const block = bot.findBlock({
-    matching: (candidate) =>
-      (candidate.name === "chest" || candidate.name === "trapped_chest") &&
-      Math.hypot(candidate.position.x - anchor.x, candidate.position.z - anchor.z) <= radius,
+    matching: (candidate) => {
+      const candidatePosition = candidate.position;
+      return (
+        (candidate.name === "chest" || candidate.name === "trapped_chest") &&
+        candidatePosition !== null &&
+        Math.hypot(candidatePosition.x - anchor.x, candidatePosition.z - anchor.z) <= radius
+      );
+    },
     point,
     // Canonical Y is approximate. Search the local vertical column while the
     // horizontal-radius predicate keeps unrelated containers out.
@@ -138,6 +143,12 @@ export async function verifyCanonicalStash(
   }
 
   stashMissCounts.delete(id);
+  // Opening or closing a Mineflayer container can invalidate the cached Block
+  // object. Keep immutable evidence before handing that object to Mineflayer.
+  const blockPosition = block.position
+    ? { x: block.position.x, y: block.position.y, z: block.position.z }
+    : { x: anchor.x, y: anchor.y, z: anchor.z };
+  const blockName = block.name;
   try {
     const container = await openContainerTimed(bot, block);
     const items = container.containerItems().map((item) => ({ name: item.name, count: item.count }));
@@ -147,10 +158,10 @@ export async function verifyCanonicalStash(
       id,
       type: "stash",
       status: "verified",
-      position: { x: block.position.x, y: block.position.y, z: block.position.z },
+      position: blockPosition,
       provenance: "world_observation",
       verifiedAt: Date.now(),
-      evidence: { block: block.name, capacity, items, openable: true },
+      evidence: { block: blockName, capacity, items, openable: true },
     });
   } catch (error) {
     const current = getSharedStructure(id);
