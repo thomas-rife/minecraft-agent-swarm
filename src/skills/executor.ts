@@ -5,7 +5,8 @@ import { updateOverlay } from "../stream/overlay.js";
 import { recordSkillAttempt } from "../bot/memory.js";
 import { getBotMemoryStore, registerBotMemory } from "../bot/memory-registry.js";
 import { cancelActiveOperation, runControlledOperation } from "../operations/controller.js";
-import { failed, operationResult, type OperationResult } from "../operations/types.js";
+import { failed, operationResult, succeeded, type OperationResult } from "../operations/types.js";
+import { getSharedStructure } from "../world/registry.js";
 
 export { registerBotMemory };
 
@@ -15,6 +16,10 @@ type ActiveSkillState = {
 };
 
 const activeSkillMap = new Map<Bot, ActiveSkillState>();
+
+// setup_stash mutates one canonical shared resource. Serialize it across bots;
+// role-specific activeSkillMap entries alone do not prevent a three-bot race.
+let setupStashTail: Promise<void> = Promise.resolve();
 
 export function isSkillRunning(bot: Bot): boolean {
   return activeSkillMap.has(bot);
@@ -34,6 +39,31 @@ export function abortActiveSkill(bot: Bot): void {
 
 /** Run a deterministic skill under the bot's single cancellable operation controller. */
 export async function runSkill(bot: Bot, skill: Skill, params: Record<string, any>): Promise<OperationResult> {
+  if (skill.name !== "setup_stash") return runSkillUnlocked(bot, skill, params);
+
+  const previous = setupStashTail;
+  let release!: () => void;
+  setupStashTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    const verified = getSharedStructure("shared-stash");
+    if (verified?.status === "verified") {
+      return succeeded("SKILL_ALREADY_SATISFIED", "Shared stash is already verified; skipped duplicate setup.", {
+        worldChanged: false,
+        postconditions: [
+          { name: "canonical_stash_openable", satisfied: true, evidence: verified.evidence ?? verified },
+        ],
+      });
+    }
+    return await runSkillUnlocked(bot, skill, params);
+  } finally {
+    release();
+  }
+}
+
+async function runSkillUnlocked(bot: Bot, skill: Skill, params: Record<string, any>): Promise<OperationResult> {
   const active = activeSkillMap.get(bot);
   if (active) {
     return failed("SKILL_ALREADY_ACTIVE", `Already running skill "${active.skill.name}".`, {
@@ -74,16 +104,23 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
         active: true,
       });
 
-      const parameterChecks: import("../operations/types.js").PostconditionResult[] = Object.entries(skill.params).map(([name, schema]) => {
-        const value = params[name];
-        const present = value !== undefined && value !== null && value !== "";
-        const typeValid = !present || schema.type === "any" || typeof value === schema.type;
-        return {
-          name: `parameter:${name}`,
-          satisfied: (schema.required === false || present) && typeValid,
-          evidence: { expectedType: schema.type, required: schema.required !== false, source: schema.source ?? "llm", present },
-        };
-      });
+      const parameterChecks: import("../operations/types.js").PostconditionResult[] = Object.entries(skill.params).map(
+        ([name, schema]) => {
+          const value = params[name];
+          const present = value !== undefined && value !== null && value !== "";
+          const typeValid = !present || schema.type === "any" || typeof value === schema.type;
+          return {
+            name: `parameter:${name}`,
+            satisfied: (schema.required === false || present) && typeValid,
+            evidence: {
+              expectedType: schema.type,
+              required: schema.required !== false,
+              source: schema.source ?? "llm",
+              present,
+            },
+          };
+        },
+      );
       parameterChecks.push(...(skill.contract?.validate?.(params) ?? []));
       const invalidParameters = parameterChecks.filter((check) => !check.satisfied);
       if (invalidParameters.length > 0) {
@@ -107,7 +144,9 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
       const materialsNeeded = skill.estimateMaterials(bot, params);
       const materialsList = Object.entries(materialsNeeded);
       if (materialsList.length > 0) {
-        console.log(`[Skill] Materials needed: ${materialsList.map(([name, count]) => `${count}x ${name}`).join(", ")}`);
+        console.log(
+          `[Skill] Materials needed: ${materialsList.map(([name, count]) => `${count}x ${name}`).join(", ")}`,
+        );
         const gathered = await gatherMaterials(bot, materialsNeeded, token.signal, (message, percent) => {
           progress({
             skillName: skill.name,

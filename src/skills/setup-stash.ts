@@ -90,7 +90,8 @@ export const setupStashSkill = defineSkill({
 
     const existingChest = bot.findBlock({
       matching: (b) => b.name === "chest" || b.name === "trapped_chest",
-      maxDistance: 8,
+      point: stashPos,
+      maxDistance: 5,
     });
 
     if (existingChest) {
@@ -280,12 +281,22 @@ export const setupStashSkill = defineSkill({
       /* close enough */
     }
 
-    // Place first chest at stashPos
-    const placed1 = await placeChestAt(bot, stashPos);
-    if (!placed1) {
+    // Try the canonical block first, then nearby verified two-chest sites. The
+    // configured anchor can land on a slope, flower, path block, or another
+    // structure; that should not trap the entire swarm in setup retries.
+    const candidates = findStashPlacementCandidates(bot, stashPos, 4).slice(0, 16);
+    let firstChestPos: Vec3 | null = null;
+    for (const candidate of candidates) {
+      if (signal.aborted) break;
+      if (await placeChestAt(bot, candidate)) {
+        firstChestPos = candidate;
+        break;
+      }
+    }
+    if (!firstChestPos) {
       return {
         success: false,
-        message: "Failed to place first chest at stash position. Check terrain.",
+        message: `No usable chest placement found within 4 blocks of stash anchor (${stashX}, ${stashY}, ${stashZ}).`,
       };
     }
 
@@ -297,28 +308,26 @@ export const setupStashSkill = defineSkill({
       active: true,
     });
 
-    // Place second chest adjacent (+1 on X axis) for double chest
-    const secondPos = stashPos.offset(1, 0, 0);
-    const placed2 = await placeChestAt(bot, secondPos);
-    if (!placed2) {
-      // Try other adjacent positions if +1 X didn't work
-      const alternatives = [stashPos.offset(-1, 0, 0), stashPos.offset(0, 0, 1), stashPos.offset(0, 0, -1)];
-      let placedAlt = false;
-      for (const altPos of alternatives) {
-        if (await placeChestAt(bot, altPos)) {
-          placedAlt = true;
-          break;
-        }
-      }
-      if (!placedAlt) {
-        return {
-          success: true, // one chest is better than none
-          message: `Placed 1 chest at stash (${stashX}, ${stashY}, ${stashZ}) but couldn't place second for double chest. Terrain issue.`,
-          stats: { chestsPlaced: 1 },
-        };
+    const adjacent = [
+      firstChestPos.offset(1, 0, 0),
+      firstChestPos.offset(-1, 0, 0),
+      firstChestPos.offset(0, 0, 1),
+      firstChestPos.offset(0, 0, -1),
+    ];
+    let placedSecond = false;
+    for (const candidate of adjacent) {
+      if (await placeChestAt(bot, candidate)) {
+        placedSecond = true;
+        break;
       }
     }
-
+    if (!placedSecond) {
+      return {
+        success: true,
+        message: `Placed one verified chest near the stash anchor at (${firstChestPos.x}, ${firstChestPos.y}, ${firstChestPos.z}); expansion can happen later.`,
+        stats: { chestsPlaced: 1 },
+      };
+    }
     onProgress({
       skillName: "setup_stash",
       phase: "Done",
@@ -329,7 +338,7 @@ export const setupStashSkill = defineSkill({
 
     return {
       success: true,
-      message: `Stash bootstrapped! Double chest placed at (${stashX}, ${stashY}, ${stashZ}). Ready for deposits.`,
+      message: `Stash bootstrapped near the canonical anchor at (${firstChestPos.x}, ${firstChestPos.y}, ${firstChestPos.z}). Ready for deposits.`,
       stats: { chestsPlaced: 2 },
     };
   },
@@ -438,6 +447,41 @@ async function ensureCraftingTable(bot: Bot, signal: AbortSignal): Promise<void>
   }
 }
 
+export function stashPlacementOffsets(radius: number): Array<{ dx: number; dz: number }> {
+  const offsets: Array<{ dx: number; dz: number }> = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) offsets.push({ dx, dz });
+  }
+  return offsets.sort((a, b) => Math.abs(a.dx) + Math.abs(a.dz) - (Math.abs(b.dx) + Math.abs(b.dz)));
+}
+
+function findStashPlacementCandidates(bot: Bot, anchor: Vec3, radius: number): Vec3[] {
+  const candidates: Vec3[] = [];
+  const replaceable = new Set(["air", "cave_air", "short_grass", "tall_grass", "snow"]);
+  const solidGround = (block: ReturnType<Bot["blockAt"]>) =>
+    !!block && !["air", "cave_air", "water", "lava"].includes(block.name) && !block.name.includes("leaves");
+
+  for (const { dx, dz } of stashPlacementOffsets(radius)) {
+    for (let y = anchor.y + 6; y >= anchor.y - 6; y--) {
+      const target = new Vec3(anchor.x + dx, y, anchor.z + dz);
+      const block = bot.blockAt(target);
+      const ground = bot.blockAt(target.offset(0, -1, 0));
+      if (!block || !replaceable.has(block.name) || !solidGround(ground)) continue;
+      const hasPartner = [
+        target.offset(1, 0, 0),
+        target.offset(-1, 0, 0),
+        target.offset(0, 0, 1),
+        target.offset(0, 0, -1),
+      ].some(
+        (partner) =>
+          replaceable.has(bot.blockAt(partner)?.name ?? "") && solidGround(bot.blockAt(partner.offset(0, -1, 0))),
+      );
+      if (hasPartner) candidates.push(target);
+      break;
+    }
+  }
+  return candidates;
+}
 /**
  * Place a chest from inventory at the given world position.
  * Returns true on success.
@@ -485,7 +529,10 @@ async function placeChestAt(bot: Bot, targetPos: Vec3): Promise<boolean> {
         .catch(() => false),
       new Promise<boolean>((r) => setTimeout(() => r(false), 3000)),
     ]);
-    return ok;
+    if (!ok) return false;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const placed = bot.blockAt(targetPos);
+    return placed?.name === "chest" || placed?.name === "trapped_chest";
   } catch {
     return false;
   }

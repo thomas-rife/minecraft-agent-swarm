@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { executeAction } from "./actions.js";
+import {
+  craftExecutionsForOutput,
+  executeAction,
+  gatherWoodBudgetExpired,
+  isVerifiedExploreProgress,
+  isVerifiedMineProgress,
+  isTransientCraftWindowFailure,
+} from "./actions.js";
 
 // ── Minimal mock bot ────────────────────────────────────────────────────────
 
@@ -155,10 +162,28 @@ test("executeAction: go_to with coordinate array [x, y, z]", async () => {
 
 // ── Action routing: explore picks random direction ──────────────────────────
 
-test("executeAction: explore with direction param", async () => {
-  const bot = mockBot();
-  const result = await executeAction(bot, "explore", { direction: "north" });
-  assert.equal(typeof result, "object");
+test("explore verification rejects blocked movement reports", () => {
+  assert.equal(isVerifiedExploreProgress("Couldn't move north — path blocked, still at 0, 64, 0.", 0), false);
+  assert.equal(isVerifiedExploreProgress("Path blocked after a partial move.", 5), false);
+  assert.equal(isVerifiedExploreProgress("Explored north and moved 12 blocks.", 12), true);
+});
+test("craft output counts account for recipe yield", () => {
+  assert.equal(craftExecutionsForOutput(4, 4), 1);
+  assert.equal(craftExecutionsForOutput(5, 4), 2);
+  assert.equal(craftExecutionsForOutput(3, 1), 3);
+});
+test("craft retry classification recognizes transient table-window failures", () => {
+  assert.equal(isTransientCraftWindowFailure("Event windowOpen did not fire within timeout of 20000ms"), true);
+  assert.equal(isTransientCraftWindowFailure("missing ingredient"), false);
+});
+test("gather_wood deadline expires deterministically", () => {
+  assert.equal(gatherWoodBudgetExpired(1_000, 999), false);
+  assert.equal(gatherWoodBudgetExpired(1_000, 1_000), true);
+});
+test("mine verification rejects expected navigation failures", () => {
+  assert.equal(isVerifiedMineProgress("Couldn't reach coal_ore at 1, 2, 3."), false);
+  assert.equal(isVerifiedMineProgress("Failed to mine coal_ore; the target remained unchanged."), false);
+  assert.equal(isVerifiedMineProgress("Mined 3x coal_ore (vein)."), true);
 });
 
 // ── Action routing: deposit/withdraw stash without position ─────────────────

@@ -1,21 +1,56 @@
-/**
- * A failure-safe FIFO for local LLM requests.
- *
- * CPU-only Ollama normally evaluates one prompt efficiently at a time. Sending
- * one request per bot concurrently makes every request count time spent waiting
- * inside Ollama against its timeout. This queue keeps that waiting outside the
- * request timeout and prevents one rejected task from poisoning later work.
- */
+/** A failure-safe FIFO for local LLM requests with bounded queue residence. */
+export class LlmQueueWaitTimeoutError extends Error {
+  constructor(readonly waitedMs: number) {
+    super(`LLM_QUEUE_WAIT_TIMED_OUT:${waitedMs}`);
+    this.name = "LlmQueueWaitTimeoutError";
+  }
+}
+
 export class SerialTaskQueue {
   private tail: Promise<void> = Promise.resolve();
 
-  run<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(task, task);
-    this.tail = result.then(
+  run<T>(task: (queueWaitMs: number) => Promise<T>, options: { maxQueueWaitMs?: number } = {}): Promise<T> {
+    const queuedAt = Date.now();
+    let expired = false;
+    const scheduled = this.tail.then(
+      async () => {
+        const queueWaitMs = Date.now() - queuedAt;
+        if (expired || (options.maxQueueWaitMs !== undefined && queueWaitMs >= options.maxQueueWaitMs)) {
+          throw new LlmQueueWaitTimeoutError(queueWaitMs);
+        }
+        return task(queueWaitMs);
+      },
+      async () => {
+        const queueWaitMs = Date.now() - queuedAt;
+        if (expired || (options.maxQueueWaitMs !== undefined && queueWaitMs >= options.maxQueueWaitMs)) {
+          throw new LlmQueueWaitTimeoutError(queueWaitMs);
+        }
+        return task(queueWaitMs);
+      },
+    );
+    this.tail = scheduled.then(
       () => undefined,
       () => undefined,
     );
-    return result;
+
+    if (options.maxQueueWaitMs === undefined) return scheduled;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        expired = true;
+        reject(new LlmQueueWaitTimeoutError(Date.now() - queuedAt));
+      }, options.maxQueueWaitMs);
+      timer.unref?.();
+      scheduled.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 }
 

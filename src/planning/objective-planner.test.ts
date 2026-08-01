@@ -60,6 +60,27 @@ test("a rejected deterministic leaf releases the planner for another step", () =
   assert.equal(planner.next(botWith())?.action, "gather_wood");
 });
 
+test("a temporarily blocked leaf schedules exploration while preserving its root objective", () => {
+  resetSharedWorldRegistry();
+  const planner = new ObjectivePlanner();
+  planner.enqueue({ thought: "", action: "craft", params: { item: "torch", count: 4 } });
+
+  assert.equal(
+    planner.next(
+      botWith([
+        { name: "coal", count: 1 },
+        { name: "stick", count: 1 },
+      ]),
+    )?.action,
+    "craft",
+  );
+  planner.record(failed("PLANNER_STEP_BLOCKED", "craft:torch is cooling down", { retryable: true }));
+
+  const fallback = planner.next(botWith());
+  assert.equal(fallback?.action, "explore");
+  assert.equal(planner.hasWork(), true);
+});
+
 test("completed craft_gear dependencies finish without invoking the skill again", () => {
   resetSharedWorldRegistry();
   const planner = new ObjectivePlanner();

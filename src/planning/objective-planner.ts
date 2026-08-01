@@ -206,9 +206,19 @@ function materialStep(objective: Objective, bot: Bot, item: string, amount: numb
   if (canonical.endsWith("_planks")) {
     const log = firstLog(bot);
     if (!log) {
-      return step(objective, "gather_wood", { count: Math.max(1, Math.ceil((amount - have) / 4)) }, "planks require logs; harvest and verify complete trees");
+      return step(
+        objective,
+        "gather_wood",
+        { count: Math.max(1, Math.ceil((amount - have) / 4)) },
+        "planks require logs; harvest and verify complete trees",
+      );
     }
-    return step(objective, "craft", { item: log.replace("_log", "_planks"), count: Math.max(1, Math.ceil((amount - have) / 4)) }, "convert verified logs into planks");
+    return step(
+      objective,
+      "craft",
+      { item: log.replace("_log", "_planks"), count: amount - have },
+      "convert verified logs into planks",
+    );
   }
 
   const recipe = RECIPE_DEPENDENCIES[canonical];
@@ -223,7 +233,7 @@ function materialStep(objective: Objective, bot: Bot, item: string, amount: numb
       const dependency = materialStep(objective, bot, input, perCraft * crafts);
       if (dependency) return dependency;
     }
-    return step(objective, "craft", { item: canonical, count: crafts }, `craft required ${canonical}`);
+    return step(objective, "craft", { item: canonical, count: amount - have }, `craft required ${canonical}`);
   }
 
   const mineSource: Record<string, string> = {
@@ -244,7 +254,12 @@ function materialStep(objective: Objective, bot: Bot, item: string, amount: numb
       const toolStep = materialStep(objective, bot, tool, 1);
       if (toolStep) return toolStep;
     }
-    return step(objective, "mine_block", { blockType: mineSource[canonical], count: amount - have }, `acquire required ${canonical}`);
+    return step(
+      objective,
+      "mine_block",
+      { blockType: mineSource[canonical], count: amount - have },
+      `acquire required ${canonical}`,
+    );
   }
   return null;
 }
@@ -324,7 +339,8 @@ export class ObjectivePlanner {
             objective.action === "craft" &&
             dependency.action === "craft" &&
             canonicalCraftItem(String(dependency.params.item), bot) === canonicalCraftItem(item, bot)
-          ) dependency.completesObjective = true;
+          )
+            dependency.completesObjective = true;
           this.inFlight = dependency;
           return this.inFlight;
         }
@@ -364,7 +380,13 @@ export class ObjectivePlanner {
             return this.inFlight;
           }
         }
-        this.inFlight = step(objective, "build_farm", objective.params, "tool chain verified; establish and plant the farm", true);
+        this.inFlight = step(
+          objective,
+          "build_farm",
+          objective.params,
+          "tool chain verified; establish and plant the farm",
+          true,
+        );
         return this.inFlight;
       }
 
@@ -399,9 +421,7 @@ export class ObjectivePlanner {
         }
         // Two chests cost 16 planks and a new crafting table costs four more.
         const chestsHeld = countNamed(bot, "chest");
-        const deficit = chestsHeld >= 2
-          ? 0
-          : Math.max(0, 20 - woodEquivalent(bot));
+        const deficit = chestsHeld >= 2 ? 0 : Math.max(0, 20 - woodEquivalent(bot));
         if (deficit > 0) {
           this.inFlight = step(
             objective,
@@ -603,6 +623,18 @@ export class ObjectivePlanner {
 
     if (activeStep.completesObjective && result.status === "succeeded") {
       this.queue.shift();
+      return;
+    }
+
+    // Preserve the root objective, but do useful movement while a transient
+    // blacklist cools down instead of selecting the same blocked leaf again.
+    if (result.code === "PLANNER_STEP_BLOCKED" && activeStep.action !== "explore") {
+      this.queue.unshift({
+        action: "explore",
+        params: { direction: ["north", "east", "south", "west"][objective.attempts % 4] },
+        attempts: 0,
+        noProgress: 0,
+      });
       return;
     }
 

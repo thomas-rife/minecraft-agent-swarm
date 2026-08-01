@@ -40,51 +40,53 @@ async function chatTimed(
   request: Parameters<Ollama["chat"]>[0],
   timeoutMs = config.ollama.requestTimeoutMs,
 ): Promise<any> {
-  const queuedAt = Date.now();
-  return localLlmQueue.run(async () => {
-    const queueWaitMs = Date.now() - queuedAt;
-    if (queueWaitMs >= 1_000) {
-      llmLog.info("LLM:queue", `${label} waited ${queueWaitMs}ms for the local CPU model.`);
-    }
+  const maxQueueWaitMs =
+    label === "reactive" ? Math.min(5_000, config.ollama.maxQueueWaitMs) : config.ollama.maxQueueWaitMs;
+  return localLlmQueue.run(
+    async (queueWaitMs) => {
+      if (queueWaitMs >= 1_000) {
+        llmLog.info("LLM:queue", `${label} waited ${queueWaitMs}ms for the local CPU model.`);
+      }
 
-    // The Ollama JS client does not expose cancellation for non-streaming chat
-    // calls. Use the HTTP endpoint directly so a timed-out request is aborted
-    // before the serial queue advances; otherwise abandoned generations keep
-    // consuming CPU and make every following request time out too.
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let timedOut = false;
-    const endpoint = `${config.ollama.host.replace(/\/+$/, "")}/api/chat`;
-    try {
-      const response = await Promise.race([
-        fetch(endpoint, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(nonStreamingChatPayload(request)),
-          signal: controller.signal,
-        }).then(async (value) => {
-          if (!value.ok) throw new Error(`OLLAMA_HTTP_${value.status}: ${(await value.text()).slice(0, 300)}`);
-          return value.json();
-        }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            timedOut = true;
-            controller.abort();
-            reject(new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`));
-          }, timeoutMs);
-          timer.unref?.();
-        }),
-      ]);
-      return response;
-    } catch (error) {
-      if (timedOut) throw new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`, { cause: error });
-      throw error;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  });
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const endpoint = `${config.ollama.host.replace(/\/+$/, "")}/api/chat`;
+      const requestStartedAt = Date.now();
+      try {
+        const response = await Promise.race([
+          fetch(endpoint, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(nonStreamingChatPayload(request)),
+            signal: controller.signal,
+          }).then(async (value) => {
+            if (!value.ok) throw new Error(`OLLAMA_HTTP_${value.status}: ${(await value.text()).slice(0, 300)}`);
+            return value.json();
+          }),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+              reject(new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`));
+            }, timeoutMs);
+            timer.unref?.();
+          }),
+        ]);
+        if (response && typeof response === "object") {
+          response.__swarmTiming = { queueWaitMs, requestDurationMs: Date.now() - requestStartedAt };
+        }
+        return response;
+      } catch (error) {
+        if (timedOut) throw new Error(`LLM_${label.toUpperCase()}_TIMED_OUT`, { cause: error });
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+    { maxQueueWaitMs },
+  );
 }
-
 export interface LLMTool {
   name: string;
   description: string;
@@ -318,7 +320,7 @@ export async function queryStrategic(
         num_predict: 192,
       },
     });
-    recordLlmResponse("strategic", config.ollama.model, response, Date.now() - startedAt);
+    recordLlmResponse("strategic", config.ollama.model, response, Date.now() - startedAt, response.__swarmTiming);
 
     llmLog.info(
       "LLM:strategic",
@@ -361,7 +363,7 @@ export async function queryReactive(
         num_predict: 384,
       },
     });
-    recordLlmResponse("reactive", config.ollama.fastModel, response, Date.now() - startedAt);
+    recordLlmResponse("reactive", config.ollama.fastModel, response, Date.now() - startedAt, response.__swarmTiming);
 
     llmLog.info(
       "LLM:reactive",
@@ -570,7 +572,7 @@ export async function queryLLM(
         num_predict: 1024,
       },
     });
-    recordLlmResponse("legacy", config.ollama.fastModel, response, Date.now() - startedAt);
+    recordLlmResponse("legacy", config.ollama.fastModel, response, Date.now() - startedAt, response.__swarmTiming);
 
     // Retry once on short/empty response
     if (response.message.content.trim().length < 20) {

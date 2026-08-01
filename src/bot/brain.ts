@@ -1155,6 +1155,9 @@ export class BotBrain {
       this.log.debug("Brain", blockMsg);
       this.events.onAction(decision.action, blockMsg);
       this.lastResult = blockMsg;
+      if (scope === "deterministic") {
+        this.objectivePlanner.record(failed("PLANNER_STEP_BLOCKED", blockMsg, { retryable: true }));
+      }
       // Trigger re-plan since this action was blocked
       setTimeout(() => this.triggerReplan(), 500);
       return;
@@ -1381,9 +1384,7 @@ export class BotBrain {
       verifyFarmSite(this.bot, "shared-farm", { x: position.x, y: position.y, z: position.z }, 16);
     }
     const mayCompleteOverallGoal = scope !== "deterministic" || decision.completesObjective === true;
-    const completedGoal = mayCompleteOverallGoal
-      ? this.goalManager.evaluateOperation(this.bot, result)
-      : null;
+    const completedGoal = mayCompleteOverallGoal ? this.goalManager.evaluateOperation(this.bot, result) : null;
     if (this.activeTaskId) {
       recordTaskResult(
         this.activeTaskId,

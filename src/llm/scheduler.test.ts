@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SerialTaskQueue } from "./scheduler.js";
+import { LlmQueueWaitTimeoutError, SerialTaskQueue } from "./scheduler.js";
 
 test("local LLM tasks run one at a time in arrival order", async () => {
   const queue = new SerialTaskQueue();
@@ -38,4 +38,25 @@ test("a failed LLM task does not block the queue", async () => {
 
   await assert.rejects(failed, /expected/);
   assert.equal(await next, "recovered");
+});
+
+test("a stale queued LLM task rejects before the running request completes", async () => {
+  const queue = new SerialTaskQueue();
+  let releaseFirst!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const first = queue.run(async () => gate);
+  let secondRan = false;
+  const second = queue.run(
+    async () => {
+      secondRan = true;
+    },
+    { maxQueueWaitMs: 10 },
+  );
+
+  await assert.rejects(second, LlmQueueWaitTimeoutError);
+  assert.equal(secondRan, false);
+  releaseFirst();
+  await first;
 });

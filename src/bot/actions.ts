@@ -117,9 +117,28 @@ function requestedItemCount(items: Iterable<{ name: string; count: number }>, re
       item.name === requested ||
       (plankAlias && item.name.endsWith("_planks")) ||
       (logAlias && item.name.endsWith("_log"))
-    ) total += item.count;
+    )
+      total += item.count;
   }
   return total;
+}
+
+export function isVerifiedExploreProgress(message: string, displacement: number): boolean {
+  return displacement >= 2 && !/could(?:n't| not) move|path blocked|still at/i.test(message);
+}
+
+export function isVerifiedMineProgress(message: string): boolean {
+  return !/^(?:No |Refusing |Couldn't |Can't |Failed )|navigation failed|not reachable/i.test(message.trim());
+}
+
+export function isTransientCraftWindowFailure(message: string): boolean {
+  return /windowOpen|window open|timeout/i.test(message);
+}
+
+export function craftExecutionsForOutput(requestedOutput: number, recipeYield: number): number {
+  const requested = Math.max(1, Math.floor(Number.isFinite(requestedOutput) ? requestedOutput : 1));
+  const yielded = Math.max(1, Math.floor(Number.isFinite(recipeYield) ? recipeYield : 1));
+  return Math.ceil(requested / yielded);
 }
 
 async function verifyDirectAction(
@@ -160,8 +179,10 @@ async function verifyDirectAction(
   }
   if (action === "craft" && typeof params.item === "string") {
     const beforeItems = [...before.inventory].map(([name, count]) => ({ name, count }));
-    const delta = requestedItemCount(bot.inventory.items(), params.item) - requestedItemCount(beforeItems, params.item);
-    const postcondition = { name: `inventory_increased:${params.item}`, satisfied: delta > 0, evidence: { delta } };
+    const resolvedItem = CRAFT_ALIASES[params.item] || params.item;
+    const delta =
+      requestedItemCount(bot.inventory.items(), resolvedItem) - requestedItemCount(beforeItems, resolvedItem);
+    const postcondition = { name: `inventory_increased:${resolvedItem}`, satisfied: delta > 0, evidence: { delta } };
     return delta > 0
       ? succeeded("ITEM_CRAFTED", message, { postconditions: [postcondition] })
       : failed("CRAFT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
@@ -178,9 +199,23 @@ async function verifyDirectAction(
       : failed("EAT_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
   }
   if (action === "mine_block") {
-    return succeeded("TARGET_BLOCK_BREAK_VERIFIED", message);
+    return isVerifiedMineProgress(message)
+      ? succeeded("TARGET_BLOCK_BREAK_VERIFIED", message)
+      : failed("MINE_TARGET_UNREACHABLE", message, { retryable: true });
   }
-  if (["explore", "gather_wood", "place_block", "build_shelter"].includes(action)) {
+  if (action === "explore") {
+    const displacement = bot.entity.position.distanceTo(before.position);
+    const explicitlyBlocked = /could(?:n't| not) move|path blocked|still at/i.test(message);
+    const postcondition = {
+      name: "meaningful_exploration_movement",
+      satisfied: isVerifiedExploreProgress(message, displacement),
+      evidence: { displacement, explicitlyBlocked },
+    };
+    return postcondition.satisfied
+      ? succeeded("ACTION_PROGRESS_VERIFIED", message, { postconditions: [postcondition] })
+      : failed("ACTION_POSTCONDITION_FAILED", message, { postconditions: [postcondition], retryable: true });
+  }
+  if (["gather_wood", "place_block", "build_shelter"].includes(action)) {
     const moved = bot.entity.position.distanceTo(before.position) > 1;
     const inventoryChanged = bot.inventory
       .items()
@@ -393,8 +428,18 @@ async function executeActionInner(
  *  Past this, the pathfinder is operating in unscouted terrain where 60+ hours
  *  of evidence shows it can't reach trunks even from 3 blocks away. */
 const WOOD_LEASH_RADIUS = 200;
+const GATHER_WOOD_BUDGET_MS = 90_000;
+
+export function gatherWoodBudgetExpired(deadline: number, now = Date.now()): boolean {
+  return now >= deadline;
+}
+
+function gatherWoodTimeLeft(deadline: number): number {
+  return Math.max(250, deadline - Date.now());
+}
 
 async function gatherWood(bot: Bot, count: number): Promise<string> {
+  const gatherDeadline = Date.now() + GATHER_WOOD_BUDGET_MS;
   // Use shared LOG_TYPES so pale_oak_log (MC 1.21.4) and future wood types are included
   const logTypes = LOG_TYPES as readonly string[];
 
@@ -465,13 +510,10 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // Aggregate travel budget: the old design allowed 4 tries x 90s per-tree goto
   // = 360s of pathing, which now trips the 150s action watchdog and hard-kills
   // the action mid-dig (Atlas/Forge hit it 4x in 10 min chasing far trees).
-  // Cap the loop at 110s so it returns gracefully (restoring movements +
-  // thinkTimeout via the finally) well before the watchdog fires. 110s + one
-  // 30s goto = 140s < 150s.
-  const gatherStart = Date.now();
+  // The cooperative 90s budget is checked inside navigation, trunk processing,
+  // drop collection, and replanting so cleanup completes before the 150s watchdog.
   for (const pos of allLogs) {
-    if (gathered >= count) break;
-    if (Date.now() - gatherStart > 110000) break;
+    if (gathered >= count || gatherWoodBudgetExpired(gatherDeadline)) break;
     let log = bot.blockAt(pos);
     if (!log || !(logTypes as readonly string[]).includes(log.name)) continue;
 
@@ -514,7 +556,12 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
         // the retry was added. Swallow the first failure; the dig retry below
         // is the real fallback either way.
         try {
-          await safeGoto(bot, new goals.GoalNear(basePos.x, basePos.y, basePos.z, 3), 30000, 12000);
+          await safeGoto(
+            bot,
+            new goals.GoalNear(basePos.x, basePos.y, basePos.z, 3),
+            Math.min(30_000, gatherWoodTimeLeft(gatherDeadline)),
+            12_000,
+          );
         } catch {
           /* fall through to the dig-enabled retry */
         }
@@ -530,10 +577,15 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
           bushMoves.maxDropDown = 3;
           bushMoves.allowParkour = false;
           bot.pathfinder.setMovements(bushMoves);
-          await safeGoto(bot, new goals.GoalNear(basePos.x, basePos.y, basePos.z, 2), 20000, 8000);
+          await safeGoto(
+            bot,
+            new goals.GoalNear(basePos.x, basePos.y, basePos.z, 2),
+            Math.min(20_000, gatherWoodTimeLeft(gatherDeadline)),
+            8_000,
+          );
         }
         const treeLogs = connectedTreeLogs(bot, basePos, logTypes, 64);
-        await digSafe(bot, log);
+        await digBlockVerified(bot, log, Math.min(4_000, gatherWoodTimeLeft(gatherDeadline)), 1);
         gathered++;
         // Fell the WHOLE trunk, not just one block: logs above float (classic
         // Minecraft) and their drops rain down the cleared column to walkable
@@ -543,13 +595,15 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
         // logs outside normal reach instead of abandoning the trunk top.
         for (const logPos of treeLogs) {
           if (logPos.equals(basePos)) continue;
-          await breakTreeLogVerified(bot, logPos, logTypes);
+          if (gatherWoodBudgetExpired(gatherDeadline)) break;
+          await breakTreeLogVerified(bot, logPos, logTypes, gatherDeadline);
           gathered++;
         }
         chopSpots.push(basePos.clone()); // remember the trunk spot to replant on
         // Walk over the drops — digging alone leaves the items on the ground
         await new Promise((r) => setTimeout(r, 600));
-        await collectNearbyDrops(bot, 8, 9000);
+        if (!gatherWoodBudgetExpired(gatherDeadline))
+          await collectNearbyDrops(bot, 8, Math.min(9_000, gatherWoodTimeLeft(gatherDeadline)));
       } finally {
         clearInterval(yGuard);
         bot.pathfinder.thinkTimeout = prevThinkTimeout;
@@ -571,7 +625,7 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // back on their own in Minecraft — without this the team permanently
   // deforests the area and wood trips range ever farther. Saplings drop from
   // the leaf decay of the trees just chopped (collected above).
-  const replanted = await replantSaplings(bot, chopSpots);
+  const replanted = await replantSaplings(bot, chopSpots, gatherDeadline);
 
   const collected = countLogsInInventory() - logsBefore;
   const replantNote = replanted > 0 ? ` Replanted ${replanted} sapling${replanted > 1 ? "s" : ""}.` : "";
@@ -587,14 +641,14 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // with no saplings AND no reachable trees is doubly stuck (182 fails/hour
   // with zero plantings — the seeds have to come from somewhere). The team
   // stash banks saplings from richer times; withdraw a handful first.
-  if (!bot.inventory.items().some((i) => i.name.endsWith("_sapling"))) {
+  if (!gatherWoodBudgetExpired(gatherDeadline) && !bot.inventory.items().some((i) => i.name.endsWith("_sapling"))) {
     try {
       await withdrawStash(bot, STASH_POS, "sapling", 8);
     } catch {
       /* stash empty or unreachable — scatterSaplings will no-op below */
     }
   }
-  const seeded = await scatterSaplings(bot, 4);
+  const seeded = await scatterSaplings(bot, 4, gatherDeadline);
   if (seeded > 0)
     return `Couldn't reach any trees, so planted ${seeded} sapling${seeded > 1 ? "s" : ""} on open ground instead — they'll grow. Do other work and gather later.`;
   return "Couldn't reach any trees this attempt (pathfinding failed). Stay near base and try again — do NOT explore far for wood.";
@@ -605,13 +659,14 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
  * forest regrows. Plants up to as many saplings as the bot is carrying.
  * Returns the number planted.
  */
-async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
+async function replantSaplings(bot: Bot, chopSpots: Vec3[], deadline: number): Promise<number> {
   const saplings = bot.inventory.items().filter((i) => i.name.endsWith("_sapling"));
   if (saplings.length === 0 || chopSpots.length === 0) return 0;
   let sapling = saplings[0];
   let planted = 0;
 
   for (const spot of chopSpots) {
+    if (gatherWoodBudgetExpired(deadline)) break;
     if (sapling.count <= 0) {
       const next = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
       if (!next) break;
@@ -627,7 +682,11 @@ async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
     if (target.name !== "air") continue;
     try {
       if (bot.entity.position.distanceTo(spot) > 4) {
-        await safeGoto(bot, new goals.GoalNear(spot.x, spot.y, spot.z, 3), 8000);
+        await safeGoto(
+          bot,
+          new goals.GoalNear(spot.x, spot.y, spot.z, 3),
+          Math.min(8_000, gatherWoodTimeLeft(deadline)),
+        );
       }
       await bot.equip(sapling, "hand");
       await bot.placeBlock(ground, new Vec3(0, 1, 0));
@@ -643,7 +702,7 @@ async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
   // pathfinder can't enter — the forest "regrew" three times and starved the
   // team anyway. Scatter a few extra saplings on OPEN grass with clearance so
   // the next generation grows spaced and reachable.
-  planted += await scatterSaplings(bot, 4);
+  if (!gatherWoodBudgetExpired(deadline)) planted += await scatterSaplings(bot, 4, deadline);
   return planted;
 }
 
@@ -653,7 +712,7 @@ async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
  * don't fuse into an unreachable thicket. This is the bots' own forestry —
  * the forest must sustain itself without outside gardening.
  */
-async function scatterSaplings(bot: Bot, max: number): Promise<number> {
+async function scatterSaplings(bot: Bot, max: number, deadline: number): Promise<number> {
   let sapling = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
   if (!sapling) return 0;
 
@@ -682,14 +741,14 @@ async function scatterSaplings(bot: Bot, max: number): Promise<number> {
   let planted = 0;
   const plantedAt: Vec3[] = [];
   for (const g of grounds) {
-    if (planted >= max) break;
+    if (planted >= max || gatherWoodBudgetExpired(deadline)) break;
     const above = bot.blockAt(g.offset(0, 1, 0));
     if (!above || above.name !== "air") continue;
     if (!isClearAround(g.offset(0, 1, 0))) continue;
     if (plantedAt.some((p) => p.distanceTo(g) < 4)) continue;
     try {
       if (bot.entity.position.distanceTo(g) > 4) {
-        await safeGoto(bot, new goals.GoalNear(g.x, g.y, g.z, 3), 8000);
+        await safeGoto(bot, new goals.GoalNear(g.x, g.y, g.z, 3), Math.min(8_000, gatherWoodTimeLeft(deadline)));
       }
       const ground = bot.blockAt(g);
       if (!ground) continue;
@@ -739,14 +798,20 @@ function blockMatcher(blockType: string): { match: (name: string) => boolean; is
 /** Discover a whole tree before the base is removed. Twenty-six-neighbour
  * connectivity includes branched/diagonal oak trunks while the cap prevents
  * touching canopies from turning into an unbounded forest operation. */
-async function breakTreeLogVerified(bot: Bot, position: Vec3, logTypes: readonly string[]): Promise<void> {
+async function breakTreeLogVerified(
+  bot: Bot,
+  position: Vec3,
+  logTypes: readonly string[],
+  deadline: number,
+): Promise<void> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (gatherWoodBudgetExpired(deadline)) throw new Error("GATHER_WOOD_DEADLINE");
     const block = bot.blockAt(position);
     if (!block || !logTypes.includes(block.name)) return;
     try {
       if (bot.entity.position.distanceTo(position) > 4.3 || !bot.canDigBlock(block)) {
-        await collectNearbyDrops(bot, 4, 2500);
+        await collectNearbyDrops(bot, 4, Math.min(2_500, gatherWoodTimeLeft(deadline)));
         const moves = new Movements(bot);
         moves.canDig = true;
         const scaffold = bot.inventory
@@ -763,12 +828,17 @@ async function breakTreeLogVerified(bot: Bot, position: Vec3, logTypes: readonly
         moves.maxDropDown = 2;
         moves.allowParkour = false;
         bot.pathfinder.setMovements(moves);
-        await safeGoto(bot, new goals.GoalNear(position.x, position.y, position.z, 3), 15000, 4000);
+        await safeGoto(
+          bot,
+          new goals.GoalNear(position.x, position.y, position.z, 3),
+          Math.min(15_000, gatherWoodTimeLeft(deadline)),
+          4_000,
+        );
       }
       const fresh = bot.blockAt(position);
       if (!fresh || !logTypes.includes(fresh.name)) return;
       if (!bot.canDigBlock(fresh)) throw new Error("TREE_LOG_OUT_OF_REACH");
-      await digBlockVerified(bot, fresh);
+      await digBlockVerified(bot, fresh, Math.min(4_000, gatherWoodTimeLeft(deadline)), 1);
       await collectNearbyDrops(bot, 4, 2500);
       return;
     } catch (error) {
@@ -855,25 +925,28 @@ async function mineBlock(
   const digMoves = new Movements(bot);
   digMoves.canDig = true;
   bot.pathfinder.setMovements(digMoves);
-  await safeGoto(bot, new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
-  await equipPickaxe(bot);
-  await digSafe(bot, block);
-  let mined = 1;
+  try {
+    try {
+      await safeGoto(bot, new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2));
+    } catch {
+      return `Couldn't reach ${block.name} at ${block.position.x}, ${block.position.y}, ${block.position.z}.`;
+    }
+    await equipPickaxe(bot);
+    try {
+      await digSafe(bot, block);
+    } catch {
+      return `Failed to mine ${block.name}; the target remained unchanged.`;
+    }
+    let mined = 1;
 
-  // Vein mining: one ore block is rarely worth the trip. Follow the connected
-  // vein (flood-fill of same-type ore) so a single mine_block yields a useful
-  // haul instead of one block at a time.
-  if (isOre) {
-    mined += await mineVein(bot, block.position, block.name, protectedAt);
+    if (isOre) mined += await mineVein(bot, block.position, block.name, protectedAt);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await collectNearbyDrops(bot, 6, 6000);
+    return isOre ? `Mined ${mined}x ${block.name} (vein).` : `Mined ${blockType}.`;
+  } finally {
+    bot.pathfinder.setMovements(safeMoves(bot));
   }
-
-  // Walk over the drops — digging alone leaves items on the ground
-  await new Promise((r) => setTimeout(r, 400));
-  await collectNearbyDrops(bot, 6, 6000);
-  bot.pathfinder.setMovements(safeMoves(bot)); // restore safe moves
-  return isOre ? `Mined ${mined}x ${block.name} (vein).` : `Mined ${blockType}.`;
 }
-
 async function equipPickaxe(bot: Bot): Promise<void> {
   // Prefer the best pickaxe so harder ores (iron needs stone+) actually drop.
   const ranks = ["netherite", "diamond", "iron", "stone", "golden", "wooden"];
@@ -1179,29 +1252,24 @@ const CRAFT_ALIASES: Record<string, string> = {
 };
 
 async function craftItem(bot: Bot, itemName: string, count: number): Promise<string> {
-  // Resolve aliases
   const resolvedName = CRAFT_ALIASES[itemName] || itemName;
   const mcData = (await import("minecraft-data")).default(bot.version);
   const item = mcData.itemsByName[resolvedName];
   if (!item) return `Unknown item: ${itemName}. Use exact Minecraft IDs like oak_planks, stick, wooden_pickaxe.`;
 
-  // Find or place crafting table (needed for 3x3 recipes like pickaxes)
-  let craftingTable = bot.findBlock({
-    matching: (b) => b.name === "crafting_table",
-    maxDistance: 32,
-  });
+  const findTable = (maxDistance = 32) =>
+    bot.findBlock({
+      matching: (block) => block.name === "crafting_table",
+      maxDistance,
+    });
+  const findRecipe = (table: ReturnType<typeof findTable>) =>
+    (table ? bot.recipesFor(item.id, null, 1, table)[0] : null) ?? bot.recipesFor(item.id, null, 1, null)[0];
 
-  // Try recipe with crafting table first (supports 3x3), fall back to hand (2x2)
-  let recipe = craftingTable ? bot.recipesFor(item.id, null, 1, craftingTable)[0] : null;
-
-  if (!recipe) {
-    // Try 2x2 hand recipe
-    recipe = bot.recipesFor(item.id, null, 1, null)[0];
-  }
+  let craftingTable = findTable();
+  let recipe = findRecipe(craftingTable);
 
   if (!recipe && !craftingTable) {
-    // No recipe without table — try auto-placing one from inventory
-    const tableItem = bot.inventory.items().find((i) => i.name === "crafting_table");
+    const tableItem = bot.inventory.items().find((inventoryItem) => inventoryItem.name === "crafting_table");
     if (tableItem) {
       const placePos = findAdjacentAir(bot);
       if (placePos) {
@@ -1209,105 +1277,147 @@ async function craftItem(bot: Bot, itemName: string, count: number): Promise<str
           await bot.equip(tableItem, "hand");
           await bot.lookAt(placePos.ref.position.offset(0.5, 0.5, 0.5));
           await bot.placeBlock(placePos.ref, placePos.face);
-          // Find the table we just placed
-          craftingTable = bot.findBlock({
-            matching: (b) => b.name === "crafting_table",
-            maxDistance: 8,
-          });
-          if (craftingTable) {
-            recipe = bot.recipesFor(item.id, null, 1, craftingTable)[0];
-          }
+          craftingTable = findTable(8);
+          recipe = findRecipe(craftingTable);
         } catch {
-          // Placement failed, continue without table
+          // Continue to material diagnostics below.
         }
       }
     }
   }
 
   if (!recipe) {
-    // Auto-convert logs → planks if missing planks (common early-game bottleneck)
-    const hasPlanks = bot.inventory.items().some((i) => i.name.endsWith("_planks"));
+    const hasPlanks = bot.inventory.items().some((inventoryItem) => inventoryItem.name.endsWith("_planks"));
     if (!hasPlanks) {
-      const logItem = bot.inventory.items().find((i) => i.name.endsWith("_log"));
+      const logItem = bot.inventory.items().find((inventoryItem) => inventoryItem.name.endsWith("_log"));
       if (logItem) {
         const planksName = logItem.name.replace("_log", "_planks");
         const planksItemData = mcData.itemsByName[planksName];
-        if (planksItemData) {
-          const planksRecipe = bot.recipesFor(planksItemData.id, null, 1, null)[0];
-          if (planksRecipe) {
-            try {
-              await bot.craft(planksRecipe, Math.floor(logItem.count), undefined);
-              console.log(`[Craft] Auto-crafted ${logItem.name} → ${planksName}`);
-            } catch {
-              /* ignore, try main recipe anyway */
-            }
-            // Re-check recipe after getting planks
-            recipe = craftingTable
-              ? bot.recipesFor(item.id, null, 1, craftingTable)[0]
-              : bot.recipesFor(item.id, null, 1, null)[0];
+        const planksRecipe = planksItemData ? bot.recipesFor(planksItemData.id, null, 1, null)[0] : undefined;
+        if (planksRecipe) {
+          try {
+            await bot.craft(planksRecipe, Math.floor(logItem.count), undefined);
+          } catch {
+            // The main recipe diagnostics below describe whatever is still missing.
           }
+          craftingTable = findTable();
+          recipe = findRecipe(craftingTable);
         }
       }
     }
   }
 
-  if (!recipe) {
-    // Provide specific missing-material feedback so the LLM knows what to gather next.
-    if (resolvedName.endsWith("_bed")) {
-      const hasWool = bot.inventory.items().some((i) => i.name.endsWith("_wool"));
-      const woolCount = bot.inventory
-        .items()
-        .filter((i) => i.name.endsWith("_wool"))
-        .reduce((s, i) => s + i.count, 0);
-      if (!hasWool || woolCount < 3) {
-        return `Can't craft ${resolvedName} — need 3 wool (you have ${woolCount}). Kill/shear nearby sheep to get wool, then craft planks + wool into a bed.`;
+  if (!recipe) return craftMaterialDiagnostic(bot, mcData, resolvedName);
+
+  let lastError = "crafting failed";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (craftingTable) {
+      bot.pathfinder.setMovements(safeMoves(bot));
+      try {
+        await safeGoto(
+          bot,
+          new goals.GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 2),
+          8_000,
+        );
+      } catch {
+        return `Can't craft ${resolvedName}: the crafting table is unreachable.`;
       }
-    }
-    if (resolvedName === "torch") {
-      const hasCoal = bot.inventory.items().some((i) => i.name === "coal" || i.name === "charcoal");
-      const hasStick = bot.inventory.items().some((i) => i.name === "stick");
-      const missing: string[] = [];
-      if (!hasCoal) missing.push("coal or charcoal (mine coal_ore with a pickaxe)");
-      if (!hasStick) missing.push("sticks (craft from planks)");
-      return `Can't craft torch — missing: ${missing.length ? missing.join(", ") : "unknown"}. Recipe: 1 coal/charcoal + 1 stick = 4 torches.`;
-    }
-    // Generic: try to identify missing ingredients from the first known recipe
-    const allRecipes = mcData.recipes?.[item.id];
-    if (allRecipes?.length) {
-      // Recipe is ShapedRecipe | ShapelessRecipe — one has inShape, the other
-      // ingredients. Cast to read both with ?? (the union type rejects each).
-      const r0 = allRecipes[0] as { ingredients?: unknown[]; inShape?: unknown[][] };
-      const needed = (r0.ingredients ?? r0.inShape?.flat() ?? []).filter(Boolean).map((ing: any) => {
-        const ingId = typeof ing === "object" ? (ing.id ?? ing) : ing;
-        return mcData.items[ingId]?.name ?? String(ingId);
-      });
-      const uniqueNeeded = [...new Set(needed)]
-        .filter((n) => n && n !== "null")
-        // Recipe variant 0 is an arbitrary wood family — don't tell the bot it
-        // specifically needs pale_oak_planks when any planks work.
-        .map((n) => (String(n).endsWith("_planks") ? "planks (any wood — craft from your logs)" : n));
-      const dedup = [...new Set(uniqueNeeded)];
-      if (dedup.length) {
-        return `Can't craft ${resolvedName} — need: ${dedup.join(", ")}. Gather those first.`;
+
+      const tableAtPosition = bot.blockAt(craftingTable.position);
+      if (!tableAtPosition || tableAtPosition.name !== "crafting_table") {
+        craftingTable = findTable();
+        recipe = findRecipe(craftingTable);
+        if (!recipe) return `Can't craft ${resolvedName}: the crafting table disappeared or is not loaded.`;
+      } else {
+        craftingTable = tableAtPosition;
+        recipe = findRecipe(craftingTable);
       }
+    } else {
+      recipe = findRecipe(null);
     }
-    return `Can't craft ${resolvedName} — missing materials or need a crafting table.`;
+
+    if (!recipe) return craftMaterialDiagnostic(bot, mcData, resolvedName);
+    const recipeYield = Number((recipe as { result?: { count?: number } }).result?.count ?? 1);
+    const executions = craftExecutionsForOutput(count, recipeYield);
+
+    try {
+      await withCraftingTableLock(craftingTable, () => bot.craft(recipe!, executions, craftingTable || undefined));
+      return `Crafted at least ${Math.max(1, count)}x ${resolvedName}.`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      const transientWindowFailure = isTransientCraftWindowFailure(lastError);
+      if (!craftingTable || !transientWindowFailure || attempt > 0) break;
+      try {
+        bot.currentWindow?.close();
+      } catch {
+        // Best-effort cleanup before one bounded retry.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      craftingTable = findTable();
+      recipe = findRecipe(craftingTable);
+    }
   }
 
-  if (craftingTable) {
-    // Walk to the crafting table
-    bot.pathfinder.setMovements(safeMoves(bot));
-    await safeGoto(
-      bot,
-      new goals.GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 2),
-      8000,
-    );
-  }
-
-  await bot.craft(recipe, count, craftingTable || undefined);
-  return `Crafted ${count}x ${resolvedName}.`;
+  return `Can't craft ${resolvedName}: ${lastError}.`;
 }
 
+const craftingTableLocks = new Map<string, Promise<void>>();
+
+async function withCraftingTableLock<T>(
+  table: { position: { x: number; y: number; z: number } } | null,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!table) return work();
+  const key = `${table.position.x},${table.position.y},${table.position.z}`;
+  const previous = craftingTableLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => gate);
+  craftingTableLocks.set(key, queued);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (craftingTableLocks.get(key) === queued) craftingTableLocks.delete(key);
+  }
+}
+
+function craftMaterialDiagnostic(bot: Bot, mcData: any, resolvedName: string): string {
+  if (resolvedName.endsWith("_bed")) {
+    const woolCount = bot.inventory
+      .items()
+      .filter((inventoryItem) => inventoryItem.name.endsWith("_wool"))
+      .reduce((total, inventoryItem) => total + inventoryItem.count, 0);
+    if (woolCount < 3) {
+      return `Can't craft ${resolvedName}: need 3 wool (you have ${woolCount}).`;
+    }
+  }
+  if (resolvedName === "torch") {
+    const hasCoal = bot.inventory.items().some((inventoryItem) => ["coal", "charcoal"].includes(inventoryItem.name));
+    const hasStick = bot.inventory.items().some((inventoryItem) => inventoryItem.name === "stick");
+    const missing: string[] = [];
+    if (!hasCoal) missing.push("coal or charcoal");
+    if (!hasStick) missing.push("stick");
+    return `Can't craft torch: missing ${missing.length ? missing.join(" and ") : "a usable recipe"}.`;
+  }
+
+  const item = mcData.itemsByName[resolvedName];
+  const recipes = item ? mcData.recipes?.[item.id] : undefined;
+  if (recipes?.length) {
+    const first = recipes[0] as { ingredients?: unknown[]; inShape?: unknown[][] };
+    const names = (first.ingredients ?? first.inShape?.flat() ?? []).filter(Boolean).map((ingredient: any) => {
+      const id = typeof ingredient === "object" ? (ingredient.id ?? ingredient) : ingredient;
+      const name = mcData.items[id]?.name ?? String(id);
+      return String(name).endsWith("_planks") ? "planks (any wood)" : name;
+    });
+    const unique = [...new Set(names)].filter((name) => name && name !== "null");
+    if (unique.length) return `Can't craft ${resolvedName}: need ${unique.join(", ")}.`;
+  }
+  return `Can't craft ${resolvedName}: missing materials or a reachable crafting table.`;
+}
 // Food ranked best→worst by hunger/saturation. The bot eats the best it has.
 // Raw meats are the critical addition: bots hunt animals and end up holding
 // raw_mutton/raw_beef, but the old list only knew cooked food — so a starving

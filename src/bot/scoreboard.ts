@@ -49,11 +49,15 @@ interface LlmStats {
   promptTokens: number;
   outputTokens: number;
   wallDurationMs: number;
+  queueWaitMs: number;
+  requestDurationMs: number;
   evalDurationMs: number;
   /** Output-token generation speed reported by Ollama, excluding prompt evaluation. */
   generationTokensPerSec: number;
   /** End-to-end latency per completed request, including prompt evaluation and queueing. */
   averageWallMs: number;
+  averageQueueWaitMs: number;
+  averageRequestMs: number;
 }
 
 const SESSION_START = Date.now();
@@ -155,6 +159,7 @@ export function recordLlmResponse(
     eval_duration?: number;
   },
   wallDurationMs: number,
+  timing: { queueWaitMs?: number; requestDurationMs?: number } = {},
 ): void {
   const key = `${kind}:${model}`;
   const llm = (stats.llm[key] ??= {
@@ -162,19 +167,26 @@ export function recordLlmResponse(
     promptTokens: 0,
     outputTokens: 0,
     wallDurationMs: 0,
+    queueWaitMs: 0,
+    requestDurationMs: 0,
     evalDurationMs: 0,
     generationTokensPerSec: 0,
     averageWallMs: 0,
+    averageQueueWaitMs: 0,
+    averageRequestMs: 0,
   });
   llm.calls++;
   llm.promptTokens += response.prompt_eval_count ?? 0;
   llm.outputTokens += response.eval_count ?? 0;
   llm.wallDurationMs += wallDurationMs;
+  llm.queueWaitMs += timing.queueWaitMs ?? 0;
+  llm.requestDurationMs += timing.requestDurationMs ?? Math.max(0, wallDurationMs - (timing.queueWaitMs ?? 0));
   // Ollama durations are nanoseconds.
   llm.evalDurationMs += (response.eval_duration ?? 0) / 1_000_000;
-  llm.generationTokensPerSec =
-    llm.evalDurationMs > 0 ? llm.outputTokens / (llm.evalDurationMs / 1000) : 0;
+  llm.generationTokensPerSec = llm.evalDurationMs > 0 ? llm.outputTokens / (llm.evalDurationMs / 1000) : 0;
   llm.averageWallMs = llm.wallDurationMs / llm.calls;
+  llm.averageQueueWaitMs = llm.queueWaitMs / llm.calls;
+  llm.averageRequestMs = llm.requestDurationMs / llm.calls;
   dirty = true;
 }
 

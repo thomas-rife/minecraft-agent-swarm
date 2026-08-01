@@ -28,6 +28,20 @@ const DOOR_TYPES = [
 /** Remember last build site so repeated build_house calls finish the same house */
 let lastBuildSite: Vec3 | null = null;
 
+function blueprintBlockPresent(bot: Bot, origin: Vec3, block: (typeof houseBlueprint.blocks)[number]): boolean {
+  const position = origin.offset(block.pos[0], block.pos[1], block.pos[2]);
+  const actual = bot.blockAt(position)?.name;
+  if (!actual || actual === "air" || actual === "cave_air" || actual === "water") return false;
+  if (block.block.endsWith("_door")) return (DOOR_TYPES as readonly string[]).includes(actual);
+  if (block.block.endsWith("_planks"))
+    return (PLANK_TYPES as readonly string[]).includes(actual) || block.phase === "structure";
+  return actual === block.block || block.phase === "structure";
+}
+
+export function missingHouseBlueprintBlocks(bot: Bot, origin: Vec3) {
+  return houseBlueprint.blocks.filter((block) => !blueprintBlockPresent(bot, origin, block));
+}
+
 export const buildHouseSkill = defineSkill({
   name: "build_house",
   description:
@@ -98,16 +112,14 @@ export const buildHouseSkill = defineSkill({
 
     console.log(`[Skill] Build site at ${origin.x}, ${origin.y}, ${origin.z}`);
 
-    // --- Step 2: Gather wood (any type) ---
-    const totalPlanksNeeded = Object.entries(bp.materials)
-      .filter(([name]) => name.endsWith("_planks"))
-      .reduce((sum, [, count]) => sum + count, 0);
-
-    // +8 margin for crafting table (4 planks) and sticks (2 planks) and waste
-    // +6 for door crafting (6 planks → 3 doors, we need 2)
-    const doorsNeeded = bp.materials["oak_door"] || 0;
-    const totalPlanksTarget = totalPlanksNeeded + 8 + (doorsNeeded > 0 ? 6 : 0);
-
+    // --- Step 2: Gather only what the repair pass still needs ---
+    const missingAtStart = missingHouseBlueprintBlocks(bot, origin);
+    const totalPlanksNeeded = missingAtStart.filter((block) => block.block.endsWith("_planks")).length;
+    const doorsNeeded = missingAtStart.filter((block) => block.block.endsWith("_door")).length;
+    const torchesNeeded = missingAtStart.filter((block) => block.block === "torch").length;
+    const tableNeeded = missingAtStart.some((block) => block.block === "crafting_table");
+    const utilityPlanks = (doorsNeeded > 0 ? 6 : 0) + (torchesNeeded > 0 ? 2 : 0) + (tableNeeded ? 4 : 0);
+    const totalPlanksTarget = totalPlanksNeeded + utilityPlanks;
     // Pull building materials from the shared stash before chopping trees. The
     // team gathers wood + cobblestone and deposits it, so the warehouse usually
     // has plenty; chopping enough planks for a whole house from scratch was the
@@ -213,22 +225,15 @@ export const buildHouseSkill = defineSkill({
       };
     }
 
-    // Craft sticks (just enough for torches — recipe uses any plank type via tags)
-    const torchesNeeded = bp.materials["torch"] || 0;
-    const sticksNeeded = Math.ceil(torchesNeeded / 4) + 1;
-    await craftSome(bot, "stick", sticksNeeded, signal);
-
-    // Craft torches
+    // Craft only the utility blocks missing from the existing structure.
     if (torchesNeeded > 0) {
+      const sticksNeeded = Math.ceil(torchesNeeded / 4) + 1;
+      await craftSome(bot, "stick", sticksNeeded, signal);
       await craftSome(bot, "torch", torchesNeeded, signal);
     }
 
-    // Craft crafting table
-    await craftSome(bot, "crafting_table", 1, signal);
-
-    // Place crafting table so we can use it for door recipe (3x3 grid)
-    await placeTableIfNeeded(bot);
-
+    if (tableNeeded || doorsNeeded > 0) await craftSome(bot, "crafting_table", 1, signal);
+    if (doorsNeeded > 0) await placeTableIfNeeded(bot);
     // Craft doors (any wood type — 6 planks → 3 doors)
     if (doorsNeeded > 0) {
       await craftDoors(bot, doorsNeeded, signal);
@@ -242,14 +247,14 @@ export const buildHouseSkill = defineSkill({
     console.log(`[Skill] Crafting done. Have ${planksReady} planks, need ~${totalPlanksNeeded}`);
 
     // --- Step 4: Place blocks from blueprint ---
-    const structureBlocks = bp.blocks.filter((b) => b.phase === "structure").sort((a, b) => a.pos[1] - b.pos[1]); // bottom-up
-
-    const interiorBlocks = bp.blocks.filter((b) => b.phase === "interior");
+    const structureBlocks = missingAtStart
+      .filter((block) => block.phase === "structure")
+      .sort((a, b) => a.pos[1] - b.pos[1]); // bottom-up
+    const interiorBlocks = missingAtStart.filter((block) => block.phase === "interior");
     const allBlocks = [...structureBlocks, ...interiorBlocks];
-    const total = allBlocks.length;
-    let placed = 0;
+    const total = bp.blocks.length;
+    let placed = total - allBlocks.length;
     let skipped = 0;
-
     for (let i = 0; i < allBlocks.length; i++) {
       if (signal.aborted) {
         return {
@@ -397,7 +402,9 @@ export const buildHouseSkill = defineSkill({
           placed,
           skipped,
           blueprint: bp.name,
-          missingComponents: postconditions.filter((condition) => !condition.satisfied).map((condition) => condition.name),
+          missingComponents: postconditions
+            .filter((condition) => !condition.satisfied)
+            .map((condition) => condition.name),
         },
       });
       return operationResult("partial", "HOUSE_INCOMPLETE", `House partially built (${placed}/${total} blocks).`, {
@@ -414,7 +421,7 @@ export const buildHouseSkill = defineSkill({
   },
 });
 
-function verifyHouseBlueprint(bot: Bot, origin: Vec3, blueprint: typeof houseBlueprint) {
+export function verifyHouseBlueprint(bot: Bot, origin: Vec3, blueprint: typeof houseBlueprint = houseBlueprint) {
   const structureBlocks = blueprint.blocks.filter((block) => block.phase === "structure");
   const occupied = structureBlocks.filter((block) => {
     const position = origin.offset(block.pos[0], block.pos[1], block.pos[2]);
@@ -422,14 +429,25 @@ function verifyHouseBlueprint(bot: Bot, origin: Vec3, blueprint: typeof houseBlu
     return actual !== undefined && actual !== "air" && actual !== "cave_air";
   }).length;
   const shellRatio = structureBlocks.length > 0 ? occupied / structureBlocks.length : 0;
-  const entrance = origin.offset(blueprint.entrance.pos[0], blueprint.entrance.pos[1], blueprint.entrance.pos[2]);
-  const doorPresent = DOOR_TYPES.includes(bot.blockAt(entrance)?.name as (typeof DOOR_TYPES)[number]);
+  const doorPositions = blueprint.blocks
+    .filter((block) => block.block.endsWith("_door"))
+    .map((block) => origin.offset(block.pos[0], block.pos[1], block.pos[2]));
+  const doorsPresent = doorPositions.filter((position) =>
+    (DOOR_TYPES as readonly string[]).includes(bot.blockAt(position)?.name ?? ""),
+  ).length;
   return [
-    { name: "house_shell_complete", satisfied: shellRatio >= 0.85, evidence: { occupied, total: structureBlocks.length, shellRatio } },
-    { name: "house_entrance_present", satisfied: doorPresent, evidence: { entrance, actual: bot.blockAt(entrance)?.name ?? null } },
+    {
+      name: "house_shell_complete",
+      satisfied: shellRatio >= 0.85,
+      evidence: { occupied, total: structureBlocks.length, shellRatio },
+    },
+    {
+      name: "house_entrance_present",
+      satisfied: doorPositions.length > 0 && doorsPresent === doorPositions.length,
+      evidence: { doorPositions, doorsPresent, required: doorPositions.length },
+    },
   ];
 }
-
 // --- Helpers ---
 
 /** Drop junk items to make room for building materials. Keep best tools, food, and building items. */

@@ -24,6 +24,7 @@ export interface SharedStructure {
 }
 
 const structures = new Map<string, SharedStructure>();
+const stashMissCounts = new Map<string, number>();
 let persistenceFile: string | null = null;
 
 export function configureSharedWorldPersistence(file = defaultStateFile("shared-structures.json")): void {
@@ -40,6 +41,14 @@ function persistStructures(): void {
 export function upsertSharedStructure(structure: SharedStructure): SharedStructure {
   const current = structures.get(structure.id);
   const merged = { ...current, ...structure };
+  // Status transitions must not retain contradictory fields from the previous
+  // state (for example status=missing with evidence.openable=true).
+  if (merged.status === "verified") {
+    delete merged.failureReason;
+  } else if (["absent", "missing", "destroyed"].includes(merged.status)) {
+    delete merged.evidence;
+    delete merged.verifiedAt;
+  }
   structures.set(structure.id, merged);
   persistStructures();
   return merged;
@@ -89,13 +98,34 @@ export async function verifyCanonicalStash(
   intendedPosition: { x: number; y: number; z: number },
   radius = 3,
 ): Promise<SharedStructure> {
-  const point = new Vec3(intendedPosition.x, intendedPosition.y, intendedPosition.z);
+  const previouslyVerified = getSharedStructure(id);
+  const anchor =
+    previouslyVerified?.status === "verified" && previouslyVerified.position
+      ? previouslyVerified.position
+      : intendedPosition;
+  const point = new Vec3(anchor.x, anchor.y, anchor.z);
   const block = bot.findBlock({
-    matching: (candidate) => candidate.name === "chest" || candidate.name === "trapped_chest",
+    matching: (candidate) =>
+      (candidate.name === "chest" || candidate.name === "trapped_chest") &&
+      Math.hypot(candidate.position.x - anchor.x, candidate.position.z - anchor.z) <= radius,
     point,
-    maxDistance: radius,
+    // Canonical Y is approximate. Search the local vertical column while the
+    // horizontal-radius predicate keeps unrelated containers out.
+    maxDistance: Math.max(32, radius),
   });
   if (!block) {
+    const current = getSharedStructure(id);
+    // One bot can have an unloaded chunk while another has already verified
+    // the canonical chest. Only repeated observations made near the site are
+    // strong enough to overturn that shared fact.
+    if (current?.status === "verified") {
+      const observer = bot.entity?.position;
+      if (!observer || Math.hypot(point.x - observer.x, point.z - observer.z) > radius + 4) return current;
+      const misses = (stashMissCounts.get(id) ?? 0) + 1;
+      stashMissCounts.set(id, misses);
+      if (misses < 3) return current;
+    }
+    stashMissCounts.delete(id);
     const missing = upsertSharedStructure({
       id,
       type: "stash",
@@ -107,6 +137,7 @@ export async function verifyCanonicalStash(
     return missing;
   }
 
+  stashMissCounts.delete(id);
   try {
     const container = await openContainerTimed(bot, block);
     const items = container.containerItems().map((item) => ({ name: item.name, count: item.count }));
@@ -122,6 +153,11 @@ export async function verifyCanonicalStash(
       evidence: { block: block.name, capacity, items, openable: true },
     });
   } catch (error) {
+    const current = getSharedStructure(id);
+    // Container opens can fail transiently while another bot is using the
+    // chest. Seeing the chest still proves it exists; preserve prior verified
+    // state instead of oscillating the registry to missing.
+    if (current?.status === "verified") return current;
     return upsertSharedStructure({
       id,
       type: "stash",
@@ -140,7 +176,12 @@ export function verifyFarmSite(
   radius = 10,
 ): SharedStructure {
   const point = new Vec3(intendedPosition.x, intendedPosition.y, intendedPosition.z);
-  const farmland = bot.findBlocks({ matching: (block) => block.name === "farmland", point, maxDistance: radius, count: 64 });
+  const farmland = bot.findBlocks({
+    matching: (block) => block.name === "farmland",
+    point,
+    maxDistance: radius,
+    count: 64,
+  });
   const water = bot.findBlock({ matching: (block) => block.name === "water", point, maxDistance: radius });
   const crops = bot.findBlocks({
     matching: (block) => ["wheat", "carrots", "potatoes", "beetroots"].includes(block.name),
@@ -169,7 +210,9 @@ export function verifyFarmSite(
     provenance: "world_observation",
     verifiedAt: verified ? Date.now() : undefined,
     evidence: { farmland: farmland.length, crops: crops.length, water: water?.position ?? null, safeWalkingSpace },
-    failureReason: verified ? undefined : "Farm requires nine farmland blocks, four crops, nearby irrigation, and four safe walking cells.",
+    failureReason: verified
+      ? undefined
+      : "Farm requires nine farmland blocks, four crops, nearby irrigation, and four safe walking cells.",
   });
 }
 
@@ -191,5 +234,6 @@ export function formatSharedWorldFacts(): string {
 
 export function resetSharedWorldRegistry(): void {
   structures.clear();
+  stashMissCounts.clear();
   persistStructures();
 }
