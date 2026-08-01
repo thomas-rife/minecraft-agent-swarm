@@ -280,28 +280,20 @@ test("memory: precondition failures don't count as real failures for broken dete
   }
 });
 
-test("memory: static skills get added to brokenSkillNames but are healed on reload", () => {
-  const { store, file, cleanup } = tmpStore();
+test("memory: static skills are never permanently blacklisted by historical failures", () => {
+  const { store, cleanup } = tmpStore();
   try {
-    // build_house is a static skill — it CAN be added to brokenSkillNames at runtime
     for (let i = 0; i < 6; i++) {
       store.recordSkillAttempt("build_house", false, 5, "crashed");
+      store.recordSkillAttempt("setup_stash", false, 5, "postcondition failed");
     }
     const broken = store.getBrokenSkills();
-    assert.ok(broken.has("build_house"), "static skills can be marked broken during a session");
-
-    // But on next load, static skills are healed from brokenSkillNames
-    const { store: store2 } = tmpStore();
-    (store2 as any).memoryFile = file;
-    const loaded = store2.load();
-    assert.ok(!loaded.brokenSkillNames.includes("build_house"), "build_house should be healed on load");
+    assert.ok(!broken.has("build_house"));
+    assert.ok(!broken.has("setup_stash"));
   } finally {
     cleanup();
   }
 });
-
-// ── Corrupted file handling ─────────────────────────────────────────────────
-
 test("memory: corrupted JSON file is handled gracefully", () => {
   const { store, file, cleanup } = tmpStore();
   try {

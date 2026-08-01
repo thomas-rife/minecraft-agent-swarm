@@ -1,6 +1,6 @@
 import type { Bot } from "mineflayer";
 import type { PostconditionResult } from "../operations/types.js";
-import { getVerifiedStructure, verifyCanonicalStash, verifyFarmSite } from "../world/registry.js";
+import { getSharedStructure, getVerifiedStructure, verifyCanonicalStash, verifyFarmSite } from "../world/registry.js";
 import type { SkillContract } from "./types.js";
 
 interface SkillBaseline {
@@ -244,7 +244,11 @@ const contracts: Record<string, SkillContract> = {
       if (![position.x, position.y, position.z].every(Number.isFinite)) {
         return [condition("canonical_stash_openable", false, { reason: "invalid_coordinates", position })];
       }
-      const stash = await verifyCanonicalStash(bot, "shared-stash", position, 5);
+      // setup_stash records the successful container open directly. Prefer that
+      // fresh evidence because a second findBlock scan can transiently miss the
+      // same chest immediately after its window closes.
+      const recorded = getSharedStructure("shared-stash");
+      const stash = recorded?.status === "verified" ? recorded : await verifyCanonicalStash(bot, "shared-stash", position, 5);
       return [condition("canonical_stash_openable", stash.status === "verified", stash.evidence ?? stash.failureReason)];
     },
     validate(params) {

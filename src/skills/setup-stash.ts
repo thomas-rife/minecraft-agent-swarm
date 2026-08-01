@@ -10,6 +10,7 @@ import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { safeGoto } from "../bot/navigation.js";
+import { upsertSharedStructure } from "../world/registry.js";
 
 export const setupStashSkill = defineSkill({
   name: "setup_stash",
@@ -100,17 +101,34 @@ export const setupStashSkill = defineSkill({
       // the completion message cannot dereference a stale block object.
       const existingChestPosition = snapshotBlockPosition(existingChest.position, stashPos);
 
-      // A stash exists — check whether it still has room. If it's full,
-      // fall through and place an additional chest (stash expansion).
-      let hasRoom = true;
+      // A stash exists — open it once, retain that verified observation, and
+      // avoid an immediate second world scan that Mineflayer may not reproduce.
+      let hasRoom = false;
       try {
         const chest = await bot.openContainer(existingChest);
         const containerSlots = chest.inventoryStart;
-        const used = chest.containerItems().length;
-        hasRoom = used < containerSlots;
-        chest.close();
-      } catch {
-        /* can't open — assume it has room to avoid pointless expansion */
+        const items = chest.containerItems().map((item) => ({ name: item.name, count: item.count }));
+        hasRoom = items.length < containerSlots;
+        try {
+          chest.close();
+        } catch {
+          /* the successful open is sufficient evidence */
+        }
+        upsertSharedStructure({
+          id: "shared-stash",
+          type: "stash",
+          status: "verified",
+          position: existingChestPosition,
+          provenance: "world_observation",
+          verifiedAt: Date.now(),
+          evidence: { block: existingChest.name, capacity: containerSlots, items, openable: true },
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return {
+          success: false,
+          message: `Chest found at ${existingChestPosition.x}, ${existingChestPosition.y}, ${existingChestPosition.z}, but it could not be opened: ${reason}`,
+        };
       }
 
       if (hasRoom) {

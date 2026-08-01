@@ -253,7 +253,7 @@ export class BotMemoryStore {
     const realFailures = skillAttempts.filter(
       (a) => !a.success && !PRECONDITION_KEYWORDS.some((k) => (a.notes || "").toLowerCase().includes(k.toLowerCase())),
     );
-    if (!success && !isPreconditionFail && realFailures.length >= 5 && !this.memory.brokenSkillNames.includes(skill)) {
+    if (!success && !isPreconditionFail && !BotMemoryStore.STATIC_SKILL_NAMES.has(skill) && realFailures.length >= 5 && !this.memory.brokenSkillNames.includes(skill)) {
       this.memory.brokenSkillNames.push(skill);
       console.log(`[Memory] ${skill} added to permanent broken skills list`);
     }
