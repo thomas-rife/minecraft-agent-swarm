@@ -9,7 +9,7 @@ import { registerBot as registerViewerBot, isUnifiedViewerStarted } from "../str
 import { startViewer } from "../stream/viewer.js";
 import { addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { abortActiveSkill } from "../skills/executor.js";
-import { registerBotMemory } from "./memory-registry.js";
+import { registerBotMemory, unregisterBotMemory } from "./memory-registry.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { BotRoleConfig, ATLAS_CONFIG } from "./role.js";
@@ -20,6 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { isNeuralServerRunning } from "../neural/bridge.js";
 import { BotBrain, type ChatMessage, type BrainEvents } from "./brain.js";
 import { recordDeath, startScoreboard } from "./scoreboard.js";
+import { registerDiagnosticBot } from "../diagnostics/memory-monitor.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -66,6 +67,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   });
 
   registerBotMemory(bot, memStore);
+  bot.once("end", () => unregisterBotMemory(bot));
 
   // Load plugins
   bot.loadPlugin(pathfinder);
@@ -74,6 +76,8 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
 
   // ── Create the event-driven brain ──
   const brain = new BotBrain(bot, roleConfig, events, memStore);
+  const unregisterDiagnostics = registerDiagnosticBot(roleConfig.name, bot, () => brain.getDiagnostics());
+  bot.once("end", unregisterDiagnostics);
 
   // ── Spawn safety ──────────────────────────────────────────────────────────
   let spawnSafetyRunning = false;
@@ -209,15 +213,16 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
 
   // ── Event handlers ────────────────────────────────────────────────────────
 
-  // In-game chat — ignore self. Other bots are heard ONLY when they address this
-  // bot by name, and at most once per sender per cooldown window. This enables
-  // team coordination ("Mason! Craft a chest!") without runaway feedback loops.
-  const BOT_USERNAMES = new Set(["Atlas", "Flora", "Forge", "Mason", "Blade"]);
+  // In-game chat is display/command-only by default. LLM replies can be enabled
+  // explicitly, but leaving them on in a shared multi-swarm world lets chat
+  // events continuously outrank strategic gameplay and makes bots stand still.
+  const BOT_USERNAMES = new Set(["Atlas", "Flora", "Forge", "Mason", "Blade", "Solo"]);
   const BOT_CHAT_COOLDOWN_MS = 45_000;
   const lastBotChatHeard = new Map<string, number>();
   bot.on("chat", async (username, message) => {
     if (!username || username === bot.username) return;
     if (BOT_USERNAMES.has(username)) {
+      if (!config.bot.respondToMinecraftChat) return;
       const mentionsMe = message.toLowerCase().includes(roleConfig.name.toLowerCase());
       const last = lastBotChatHeard.get(username) ?? 0;
       if (!mentionsMe || Date.now() - last < BOT_CHAT_COOLDOWN_MS) return;
@@ -263,14 +268,18 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
       return;
     }
 
-    // Queue for the brain to process
+    // Keep ordinary chat visible in the overlay without spending an LLM call
+    // or inserting a higher-priority chat event into the brain queue.
+    addChatMessage(username, message, "free");
+    if (!config.bot.respondToMinecraftChat) return;
+
+    // Explicit opt-in legacy behavior: queue a conversational LLM response.
     brain.queueChat({
       source: "minecraft",
       username,
       message,
       timestamp: Date.now(),
     });
-    addChatMessage(username, message, "free");
   });
 
   // Death cause capture — the server's death message ("X drowned", "X
@@ -308,9 +317,9 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
   });
 
   // Re-run spawn safety on every respawn
-  // Only the first bot (Atlas) sends gamerule commands to avoid disconnect.spam kicks
+  // In a team Atlas owns server setup; in solo mode the sole player owns it.
   bot.on("spawn", async () => {
-    if (roleConfig.username === "Atlas") {
+    if (!config.multiBot.enabled || roleConfig.username === "Atlas") {
       bot.chat("/gamerule keepInventory true");
       await new Promise((r) => setTimeout(r, 500));
       bot.chat("/gamerule doMobSpawning true");
@@ -324,7 +333,9 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     console.log("[Bot] Spawned! Starting event-driven brain...");
 
     // Start browser viewer — use unified viewer if available, fall back to per-bot viewer
-    if (isUnifiedViewerStarted()) {
+    if (!config.viewer.enabled) {
+      console.log(`[Viewer] Disabled for ${roleConfig.name}.`);
+    } else if (isUnifiedViewerStarted()) {
       registerViewerBot(roleConfig.name, bot);
     } else {
       startViewer(bot, roleConfig.viewerPort);
@@ -360,6 +371,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
     queueChat: (msg: ChatMessage) => brain.queueChat(msg),
     stop: () => {
       brain.stop();
+      unregisterDiagnostics();
       bot.quit();
     },
   };

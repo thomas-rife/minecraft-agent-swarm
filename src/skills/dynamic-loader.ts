@@ -344,6 +344,12 @@ const STATIC_SKILL_NAMES = new Set([
   "smelt_ores",
   "go_fishing",
   "build_bridge",
+  "build_structure",
+  "setup_stash",
+  "gather_seeds",
+  "locate_farm_site",
+  "survey_region",
+  "establish_animal_pen",
 ]);
 
 export function getDynamicSkillNames(): string[] {

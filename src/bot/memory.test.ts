@@ -46,6 +46,41 @@ function tmpStore(): { store: BotMemoryStore; file: string; cleanup: () => void 
 
 // ── Save and load ───────────────────────────────────────────────────────────
 
+test("memory: verified progression and storage evidence survive restart without shared mutable arrays", () => {
+  const { store, file, cleanup } = tmpStore();
+  try {
+    store.saveProgressionObjectives(["wood_supply", "crafting_station", "wood_supply"]);
+    store.recordProgressionStorage("deposited");
+    const reloaded = new BotMemoryStore("test-memory.json");
+    (reloaded as any).memoryFile = file;
+    reloaded.load();
+    assert.deepEqual(reloaded.getProgressionObjectives(), ["crafting_station", "wood_supply"]);
+    assert.equal(reloaded.getProgressionStorage().deposited, true);
+    assert.equal(reloaded.getProgressionStorage().retrieved, false);
+    const copy = reloaded.getProgressionObjectives();
+    copy.push("starter_shelter");
+    assert.equal(reloaded.getProgressionObjectives().length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: new stores never share mutable default arrays", () => {
+  const first = new BotMemoryStore("isolated-a.json");
+  const second = new BotMemoryStore("isolated-b.json");
+
+  // Avoid writing into the project; the assertion concerns the in-memory
+  // graphs created by each constructor.
+  (first as any).save = () => {};
+  first.addStructure("house", 1, 64, 1);
+  first.recordSkillAttempt("build_house", true, 1, "done");
+
+  assert.equal(first.getStats().structures, 1);
+  assert.equal(first.getStats().skills, 1);
+  assert.equal(second.getStats().structures, 0);
+  assert.equal(second.getStats().skills, 0);
+});
+
 test("memory: save and load round-trip", () => {
   const { store, file, cleanup } = tmpStore();
   try {
@@ -129,6 +164,102 @@ test("memory: getNearestStructure returns null when no match", () => {
   try {
     const nearest = store.getNearestStructure("house", 0, 0);
     assert.equal(nearest, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: farm candidates persist before a completed farm exists", () => {
+  const { store, file, cleanup } = tmpStore();
+  try {
+    store.rememberFarmSite({ x: 113, y: 63, z: 191 }, { x: 112, y: 64, z: 190 });
+    assert.equal(store.getFarmSites().length, 1);
+    assert.equal(store.getFarmSites()[0]?.status, "discovered");
+    assert.equal(store.getStats().structures, 0);
+
+    const { store: reloaded } = tmpStore();
+    (reloaded as any).memoryFile = file;
+    reloaded.load();
+    assert.deepEqual(reloaded.getFarmSites()[0]?.water, { x: 113, y: 63, z: 191 });
+    assert.deepEqual(reloaded.getFarmSites()[0]?.approach, { x: 112, y: 64, z: 190 });
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: repeatedly unreachable farm candidates become blocked but can be rediscovered", () => {
+  const { store, cleanup } = tmpStore();
+  try {
+    const water = { x: 113, y: 63, z: 191 };
+    const approach = { x: 112, y: 64, z: 190 };
+    store.rememberFarmSite(water, approach);
+    store.updateFarmSite(water, "discovered", "no path");
+    store.updateFarmSite(water, "discovered", "no path");
+    store.updateFarmSite(water, "discovered", "no path");
+    assert.equal(store.getFarmSites()[0]?.status, "blocked");
+
+    store.rememberFarmSite(water, { x: 114, y: 64, z: 190 });
+    assert.equal(store.getFarmSites()[0]?.status, "discovered");
+    assert.deepEqual(store.getFarmSites()[0]?.approach, { x: 114, y: 64, z: 190 });
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: farm plot ledgers persist, merge duplicates, and cannot be mutated by callers", () => {
+  const { store, file, cleanup } = tmpStore();
+  try {
+    const water = { x: 113, y: 63, z: 191 };
+    store.rememberFarmSite(water, { x: 112, y: 64, z: 190 });
+    store.recordFarmPlots(water, [
+      { x: 112, y: 63, z: 191 },
+      { x: 112, y: 63, z: 191 },
+      { x: 114, y: 63, z: 191 },
+    ]);
+    assert.equal(store.getFarmSites()[0]?.status, "planted");
+    assert.equal(store.getFarmSites()[0]?.plots?.length, 2);
+
+    const external = store.getFarmSites()[0]?.plots?.[0];
+    assert.ok(external);
+    external.x = 999;
+    assert.notEqual(store.getFarmSites()[0]?.plots?.[0]?.x, 999);
+
+    const { store: reloaded } = tmpStore();
+    (reloaded as any).memoryFile = file;
+    reloaded.load();
+    assert.equal(reloaded.getFarmSites()[0]?.plots?.length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: repeatedly invalid farm plots can be retired from the durable ledger", () => {
+  const { store, cleanup } = tmpStore();
+  try {
+    const water = { x: 113, y: 63, z: 191 };
+    const plot = { x: 112, y: 63, z: 191 };
+    store.rememberFarmSite(water, { x: 112, y: 64, z: 190 });
+    store.recordFarmPlots(water, [plot]);
+
+    assert.equal(store.recordFarmPlotInvalid(water, plot), 1);
+    assert.equal(store.recordFarmPlotInvalid(water, plot), 2);
+    assert.equal(store.recordFarmPlotInvalid(water, plot), 3);
+    assert.equal(store.removeFarmPlot(water, plot), true);
+    assert.equal(store.getFarmSites()[0]?.plots?.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: a transient path failure does not downgrade an established farm", () => {
+  const { store, cleanup } = tmpStore();
+  try {
+    const water = { x: 113, y: 63, z: 191 };
+    store.rememberFarmSite(water, { x: 112, y: 64, z: 190 });
+    store.recordFarmPlots(water, [{ x: 112, y: 63, z: 191 }]);
+    store.updateFarmSite(water, "discovered", "temporary path timeout");
+    assert.equal(store.getFarmSites()[0]?.status, "planted");
+    assert.equal(store.getFarmSites()[0]?.lastFailure, "temporary path timeout");
   } finally {
     cleanup();
   }
@@ -280,17 +411,15 @@ test("memory: precondition failures don't count as real failures for broken dete
   }
 });
 
-test("memory: static skills get added to brokenSkillNames but are healed on reload", () => {
+test("memory: static skills only cool down and never enter the permanent blacklist", () => {
   const { store, file, cleanup } = tmpStore();
   try {
-    // build_house is a static skill — it CAN be added to brokenSkillNames at runtime
     for (let i = 0; i < 6; i++) {
       store.recordSkillAttempt("build_house", false, 5, "crashed");
     }
     const broken = store.getBrokenSkills();
-    assert.ok(broken.has("build_house"), "static skills can be marked broken during a session");
+    assert.ok(!broken.has("build_house"), "source-backed skills must remain repairable during a session");
 
-    // But on next load, static skills are healed from brokenSkillNames
     const { store: store2 } = tmpStore();
     (store2 as any).memoryFile = file;
     const loaded = store2.load();
@@ -351,6 +480,30 @@ test("memory: season goal set and get", () => {
     assert.equal(store.getSeasonGoal(), "Build a castle");
     store.clearSeasonGoal();
     assert.equal(store.getSeasonGoal(), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+// ── Hierarchical objective commitment ──────────────────────────────────────
+
+test("memory: objective and sub-objective survive a save/load round-trip", () => {
+  const { store, file, cleanup } = tmpStore();
+  try {
+    store.chooseObjective("food_production", "The settlement needs renewable food.");
+    store.chooseSubobjective("prepare_farm_supplies");
+
+    const { store: reloaded } = tmpStore();
+    (reloaded as any).memoryFile = file;
+    reloaded.load();
+
+    assert.equal(reloaded.getObjectiveCommitment()?.objectiveId, "food_production");
+    assert.equal(reloaded.getObjectiveCommitment()?.subobjectiveId, "prepare_farm_supplies");
+    assert.match(reloaded.getMemoryContext(), /food_production → prepare_farm_supplies/);
+
+    reloaded.clearObjectiveSubobjective();
+    assert.equal(reloaded.getObjectiveCommitment()?.objectiveId, "food_production");
+    assert.equal(reloaded.getObjectiveCommitment()?.subobjectiveId, undefined);
   } finally {
     cleanup();
   }
@@ -434,6 +587,23 @@ test("memory: healBrokenSkillsFromRegistry removes registered skills", () => {
     const broken = store.getPersistentBrokenSkillNames();
     assert.ok(!broken.has("my_dynamic_skill"));
     assert.ok(broken.has("other_skill"));
+  } finally {
+    cleanup();
+  }
+});
+
+test("memory: scoped survey and safety evidence persists without duplicate identifiers", () => {
+  const { store, cleanup } = tmpStore();
+  try {
+    store.recordScoutSector("north", { x: 132, y: 70, z: 115 }, { x: 130, y: 72, z: 120 }, ["trees", "water", "trees"]);
+    store.recordScoutSector("north", { x: 132, y: 70, z: 115 }, { x: 131, y: 71, z: 117 }, ["iron"]);
+    store.recordSafetyZone("core", { x: 132, y: 70, z: 179 }, 8);
+    store.recordSafetyZone("core", { x: 132, y: 70, z: 179 }, 12);
+
+    assert.equal(store.getScoutSectors().length, 1);
+    assert.deepEqual(store.getScoutSectors()[0].observations, ["iron"]);
+    assert.equal(store.getSafetyZones().length, 1);
+    assert.equal(store.getSafetyZones()[0].torchesPlaced, 12);
   } finally {
     cleanup();
   }

@@ -12,6 +12,9 @@ type ActiveSkillState = {
   abortController: AbortController;
   promise: Promise<SkillResult>;
   startTime: number;
+  settled: boolean;
+  timedOutAt?: number;
+  recycleTimer?: ReturnType<typeof setTimeout>;
 };
 
 // Per-bot skill state — keyed by bot instance so multiple bots don't interfere.
@@ -23,6 +26,17 @@ export function isSkillRunning(bot: Bot): boolean {
 
 export function getActiveSkillName(bot: Bot): string | null {
   return activeSkillMap.get(bot)?.skill.name ?? null;
+}
+
+export function getActiveSkillDiagnostics(bot: Bot): Record<string, unknown> | null {
+  const active = activeSkillMap.get(bot);
+  if (!active) return null;
+  return {
+    name: active.skill.name,
+    ageSec: Math.round((Date.now() - active.startTime) / 1000),
+    settled: active.settled,
+    timedOutSecAgo: active.timedOutAt ? Math.round((Date.now() - active.timedOutAt) / 1000) : null,
+  };
 }
 
 export function abortActiveSkill(bot: Bot): void {
@@ -106,7 +120,21 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
     });
   });
 
-  activeSkillMap.set(bot, { skill, abortController, promise: skillPromise, startTime });
+  const activeState: ActiveSkillState = {
+    skill,
+    abortController,
+    promise: skillPromise,
+    startTime,
+    settled: false,
+  };
+  activeSkillMap.set(bot, activeState);
+  // Promise.race does not cancel its losing promise. Track the real procedure
+  // until it settles so a timed-out skill cannot silently coexist with a new
+  // skill while retaining a full bot/world closure indefinitely.
+  skillPromise.then(
+    () => settleUnderlyingSkill(bot, activeState),
+    () => settleUnderlyingSkill(bot, activeState),
+  );
 
   // Skill chatter — bot narrates every 30s so the stream isn't dead air during long skills
   const SKILL_QUIPS = [
@@ -137,6 +165,7 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
   let watchdog: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<{ success: boolean; message: string }>((resolve) => {
     watchdog = setTimeout(() => {
+      activeState.timedOutAt = Date.now();
       try {
         bot.pathfinder.stop();
       } catch {
@@ -151,6 +180,22 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
         /* wasn't digging */
       }
       abortController.abort();
+      activeState.recycleTimer = setTimeout(() => {
+        if (activeState.settled || activeSkillMap.get(bot) !== activeState) return;
+        console.error(
+          `[Skill] "${skill.name}" did not settle 10s after abort; recycling ${bot.username} to release retained world state.`,
+        );
+        try {
+          bot.quit("Timed-out skill did not stop");
+        } catch {
+          try {
+            bot.end();
+          } catch {
+            /* connection is already gone */
+          }
+        }
+      }, 10_000);
+      activeState.recycleTimer.unref?.();
       resolve({
         success: false,
         message: `${skill.name} timed out after ${MAX_SKILL_MS / 1000}s — aborted to free the bot.`,
@@ -195,6 +240,17 @@ export async function runSkill(bot: Bot, skill: Skill, params: Record<string, an
   } finally {
     if (watchdog) clearTimeout(watchdog);
     clearInterval(chatterInterval);
+    if (!activeState.timedOutAt || activeState.settled) {
+      activeSkillMap.delete(bot);
+    }
+  }
+}
+
+function settleUnderlyingSkill(bot: Bot, state: ActiveSkillState): void {
+  state.settled = true;
+  if (state.recycleTimer) clearTimeout(state.recycleTimer);
+  if (activeSkillMap.get(bot) === state && state.timedOutAt) {
     activeSkillMap.delete(bot);
+    console.log(`[Skill] Timed-out "${state.skill.name}" finally settled; retained state released.`);
   }
 }

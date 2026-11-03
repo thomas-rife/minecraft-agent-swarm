@@ -8,6 +8,8 @@ import { fileURLToPath } from "url";
 import type { BotRoleConfig } from "../bot/role.js";
 import { getStashSummary } from "../skills/stash-ledger.js";
 import { getSessionStats } from "../bot/scoreboard.js";
+import { getAllMemoryStores } from "../bot/memory-registry.js";
+import { evaluateProgression } from "../bot/progression-tree.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,6 +25,14 @@ export function startDashboard(roster: BotRoleConfig[]) {
   // API endpoint: live stash contents (from chest snapshots at each deposit/withdraw)
   app.get("/api/stash", (_req, res) => {
     res.json(getStashSummary());
+  });
+
+  app.get("/api/progression", (_req, res) => {
+    res.json(
+      evaluateProgression({
+        completedObjectives: [...new Set(getAllMemoryStores().flatMap((store) => store.getProgressionObjectives()))],
+      }),
+    );
   });
 
   // API endpoint: live model throughput and action-success measurements.

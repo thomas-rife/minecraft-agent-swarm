@@ -39,9 +39,27 @@ export const config = {
     idleIntervalMs: parseInt(process.env.BOT_IDLE_INTERVAL_MS || "10000"),
     /** Enable the critic step after each action (uses an extra LLM call per action). */
     criticEnabled: process.env.BOT_CRITIC_ENABLED !== "false",
+    /**
+     * Normal Minecraft chat is display-only by default. Enabling automatic
+     * replies lets other players/bots flood higher-priority chat events and
+     * starve the strategic gameplay loop.
+     */
+    respondToMinecraftChat: process.env.RESPOND_TO_MC_CHAT === "true",
   },
   multiBot: {
     enabled: process.env.ENABLE_MULTI_BOT === "true",
     count: parseInt(process.env.BOT_COUNT || "1"),
+  },
+  diagnostics: {
+    memoryEnabled: process.env.MEMORY_DIAGNOSTICS !== "false",
+    memoryIntervalMs: parseInt(process.env.MEMORY_DIAGNOSTICS_INTERVAL_MS || "60000"),
+    heapSnapshots: process.env.MEMORY_HEAP_SNAPSHOTS === "true",
+    heapSnapshotThresholdsMb: (process.env.MEMORY_HEAP_SNAPSHOT_THRESHOLDS_MB || "1536,2560,3584")
+      .split(",")
+      .map((value) => parseInt(value.trim()))
+      .filter((value) => Number.isFinite(value) && value > 0),
+  },
+  viewer: {
+    enabled: process.env.ENABLE_UNIFIED_VIEWER !== "false",
   },
 };

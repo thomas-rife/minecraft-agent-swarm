@@ -25,7 +25,12 @@ export const craftGearSkill: Skill = {
   name: "craft_gear",
   description:
     "Craft the best tools (pickaxe, axe, sword, shovel) AND armor (helmet, chestplate, leggings, boots) from available materials; pulls iron from the stash. The bot auto-equips crafted armor.",
-  params: {},
+  params: {
+    target: {
+      type: "string",
+      description: "Optional bounded target: work_kit, iron_tools, or iron_armor",
+    },
+  },
 
   estimateMaterials(_bot, _params) {
     // This skill uses whatever is already in inventory — no gathering phase
@@ -35,7 +40,17 @@ export const craftGearSkill: Skill = {
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {
     const mcData = mcDataLoader(bot.version);
     const crafted: string[] = [];
-    const total = TOOL_TYPES.length;
+    const target = ["work_kit", "iron_tools", "iron_armor"].includes(String(params?.target))
+      ? String(params.target)
+      : "all";
+    if (gearTargetComplete(bot, target)) {
+      return { success: true, message: `Gear target ${target} already complete.` };
+    }
+    const selectedToolTypes =
+      target === "work_kit" ? ["pickaxe", "axe", "sword"] : target === "iron_tools" ? ["pickaxe", "sword"] : target === "iron_armor" ? [] : TOOL_TYPES;
+    const allowedTiers =
+      target === "work_kit" ? TIERS.filter((tier) => tier.name !== "wooden") : target === "iron_tools" ? TIERS.filter((tier) => tier.name === "diamond" || tier.name === "iron") : TIERS;
+    const total = Math.max(1, selectedToolTypes.length);
     let done = 0;
 
     // Pull iron ingots from the shared stash before crafting (the stash is the
@@ -44,7 +59,7 @@ export const craftGearSkill: Skill = {
     // for stone/wood tools and never made iron, even though the team had smelted
     // plenty. Mirrors smelt_ores' stash withdrawal.
     const stashPos = params?.stashPos as { x: number; y: number; z: number } | undefined;
-    if (stashPos && !signal.aborted) {
+    if (stashPos && !signal.aborted && target !== "work_kit") {
       const ironIngots = bot.inventory
         .items()
         .filter((i) => i.name === "iron_ingot")
@@ -150,14 +165,14 @@ export const craftGearSkill: Skill = {
     // Crafting the chestplate before tools routes the bot's handful of iron to
     // survival gear first; tools still get crafted after (and stone fallbacks
     // cover most tasks). The brain's auto-equip timer then wears it.
-    if (!signal.aborted && !bot.inventory.items().some((i) => i.name === "iron_chestplate")) {
+    if ((target === "all" || target === "iron_armor") && !signal.aborted && !hasItem(bot, "iron_chestplate")) {
       await craftPiece(bot, mcData, "iron_chestplate", crafted);
     }
 
     // Ensure we have sticks (need at least 8 for a full set)
     await ensureSticks(bot, 8, signal);
 
-    for (const toolType of TOOL_TYPES) {
+    for (const toolType of selectedToolTypes) {
       if (signal.aborted) break;
 
       done++;
@@ -170,7 +185,7 @@ export const craftGearSkill: Skill = {
       });
 
       // Try each tier from best to worst
-      for (const tier of TIERS) {
+      for (const tier of allowedTiers) {
         const itemName = `${tier.name}_${toolType}`;
         const mcItem = mcData.itemsByName[itemName];
         if (!mcItem) continue;
@@ -246,7 +261,7 @@ export const craftGearSkill: Skill = {
     }
 
     // --- Craft ARMOR (iron/diamond) — the brain's auto-equip timer wears it ---
-    for (const piece of ARMOR_TYPES) {
+    for (const piece of target === "all" || target === "iron_armor" ? ARMOR_TYPES : []) {
       if (signal.aborted) break;
       for (const tier of ARMOR_TIERS) {
         const itemName = `${tier}_${piece}`;
@@ -297,6 +312,17 @@ export const craftGearSkill: Skill = {
 
     const newlyCrafted = crafted.filter((c) => !c.includes("already had"));
 
+    if (gearTargetComplete(bot, target)) {
+      return {
+        success: true,
+        message:
+          newlyCrafted.length > 0
+            ? `Gear crafted! Got: ${newlyCrafted.join(", ")}. Target ${target} complete.`
+            : `Gear target ${target} already complete.`,
+        stats: { toolsCrafted: newlyCrafted.length },
+      };
+    }
+
     if (crafted.length === 0 || newlyCrafted.length === 0) {
       // No new tools made — report what's missing so the LLM knows to get materials
       const missing = TOOL_TYPES.map((t) => {
@@ -318,11 +344,35 @@ export const craftGearSkill: Skill = {
 
     return {
       success: true,
-      message: `Gear crafted! Got: ${newlyCrafted.join(", ")}. Ready for action!`,
+      message: `Gear progressed! Got: ${newlyCrafted.join(", ")}. Target ${target} still needs another bounded pass.`,
       stats: { toolsCrafted: newlyCrafted.length },
     };
   },
 };
+
+function allCarriedAndEquippedNames(bot: Bot): string[] {
+  const slots = ((bot.inventory as any).slots ?? []) as Array<{ name?: string } | null>;
+  return slots.filter((item): item is { name: string } => !!item?.name).map((item) => item.name);
+}
+
+function hasItem(bot: Bot, name: string): boolean {
+  return allCarriedAndEquippedNames(bot).includes(name);
+}
+
+function hasToolAtTier(bot: Bot, tool: string, minimum: "stone" | "iron"): boolean {
+  const names = allCarriedAndEquippedNames(bot);
+  const tiers = minimum === "iron" ? ["iron", "diamond", "netherite"] : ["stone", "iron", "diamond", "netherite"];
+  return tiers.some((tier) => names.includes(`${tier}_${tool}`));
+}
+
+function gearTargetComplete(bot: Bot, target: string): boolean {
+  if (target === "work_kit") return ["pickaxe", "axe", "sword"].every((tool) => hasToolAtTier(bot, tool, "stone"));
+  if (target === "iron_tools") return ["pickaxe", "sword"].every((tool) => hasToolAtTier(bot, tool, "iron"));
+  if (target === "iron_armor") {
+    return ARMOR_TYPES.every((piece) => ["iron", "diamond", "netherite"].some((tier) => hasItem(bot, `${tier}_${piece}`)));
+  }
+  return false;
+}
 
 /** Craft one gear item (tool/armor) at a crafting table, verifying it appeared. Returns true if crafted. */
 async function craftPiece(

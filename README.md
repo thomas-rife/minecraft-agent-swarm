@@ -134,6 +134,7 @@ OLLAMA_FAST_MODEL=gpt-oss:20b  # Same model — avoids VRAM eviction thrash betw
 # Bot identity
 BOT_NAME=Atlas
 BOT_IDLE_INTERVAL_MS=10000   # How often the brain re-plans when nothing is happening
+BOT_CRITIC_ENABLED=false     # Disable the extra post-action LLM review
 BOT_CHAT_COOLDOWN_MS=3000
 
 # Multi-bot mode
@@ -150,12 +151,34 @@ TWITCH_BOT_USERNAME=your_bot
 TWITCH_OAUTH_TOKEN=oauth:...
 ```
 
+Ollama server concurrency is configured separately from this repository's
+`.env`. On macOS, set one inference slot and then restart Ollama yourself:
+
+```bash
+launchctl setenv OLLAMA_NUM_PARALLEL 1
+```
+
+Parallel slots multiply the model's context-memory allocation. Test them
+carefully: two slots reduced aggregate throughput on a 24 GB base M4 with
+Qwen2.5 Coder 7B, despite reducing queue time.
+
 ### Run
 
 ```bash
 # Start Minecraft server first, then:
 npm run dev
 ```
+
+`npm run dev` runs the swarm under a small child-process supervisor. If Node
+exits unexpectedly (including a heap OOM), the swarm is restarted after 15
+seconds. Use `npm run dev:watch` instead when actively editing and you want
+tsx hot reload.
+
+Memory diagnostics are enabled by default and append one sample per minute to
+`logs/memory/*.jsonl`. For a focused leak run, set
+`MEMORY_HEAP_SNAPSHOTS=true`; snapshots are written at the configured heap
+thresholds to `logs/heap-snapshots/` and can be several GB. Set
+`ENABLE_UNIFIED_VIEWER=false` for a viewer-disabled A/B run.
 
 The bots will:
 1. Connect to the Minecraft server (staggered 10s apart)
@@ -253,15 +276,17 @@ Each decision executes a gated action (restricted to the bot's allowed actions/s
 ### Skill System
 
 **TypeScript skills** (assigned per role):
-- `build_house` — build a 7x7 shelter with doors, crafting table, torches
+- `build_house` — prepare a bounded site and build/resume the shared 9x9 starter lodge
 - `build_farm` — hoe dirt, plant wheat near water, harvest when ready
 - `build_bridge` — bridge across water/gaps in facing direction
 - `craft_gear` — craft the best available tool set (tries diamond→iron→stone→wood per tool)
 - `strip_mine` — staircase down to Y=11, then tunnel — scans the surrounding walls and follows any ore vein it exposes
 - `smelt_ores` — smelt raw ore into ingots, crafts a furnace from cobblestone if needed
-- `light_area` — place torches in a radius
+- `light_area` — place and verify torches for a named settlement safety zone
 - `go_fishing` — cast and reel a fishing rod
-- `setup_stash` — bootstrap shared chest area
+- `setup_stash` — bootstrap the shared chest area or add verified expansion capacity
+- `survey_region` — map one of eight bounded settlement sectors and return to base
+- `establish_animal_pen` — build a resumable pen, contain a pair, and supply breeding feed
 - `neural_combat` — 50ms tick reactive combat via Python server
 
 **Voyager JS skills** (57 skills, run in vm sandbox):
@@ -462,9 +487,10 @@ minecraft-agent-swarm/
 ## Development
 
 ```bash
-npm run dev     # Run with tsx watch (hot reload)
-npm test        # Run tests
-npm run build   # Compile TypeScript
+npm run dev        # Run under the crash-restarting supervisor
+npm run dev:watch  # Run with tsx watch (hot reload)
+npm test           # Run tests
+npm run build      # Compile TypeScript
 ```
 
 ### Adding a New TypeScript Skill

@@ -41,7 +41,10 @@ for (const file of fs.readdirSync(TRAJ_DIR).filter((f) => f.endsWith(".jsonl")))
     } catch {
       continue;
     }
-    if (!e.success) continue; // only train on what worked
+    // Rejected/no-op proposals are useful diagnostics but not demonstrations.
+    // `executed` is absent on legacy trajectories, so those retain the old
+    // behavior while new neutral skips stay out of the fine-tuning dataset.
+    if (!e.success || e.executed === false) continue; // only train on real work that succeeded
     if (!e.decision?.action || e.decision.action === "idle") continue;
 
     const assistant = JSON.stringify({

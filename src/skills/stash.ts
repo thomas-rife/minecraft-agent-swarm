@@ -7,6 +7,7 @@ import { snapshotChest } from "./stash-ledger.js";
 import pkg from "mineflayer-pathfinder";
 const { goals } = pkg;
 import { safeGoto } from "../bot/actions.js";
+import { config } from "../config.js";
 
 /** bot.openContainer with a hard timeout — a chest GUI that never opens (block
  *  not truly reachable/loaded) otherwise blocks forever, hanging the calling
@@ -16,6 +17,40 @@ async function openContainerTimed(bot: Bot, block: Parameters<Bot["openContainer
     bot.openContainer(block),
     new Promise((_, rej) => setTimeout(() => rej(new Error("openContainer timeout")), 10000)),
   ])) as Awaited<ReturnType<Bot["openContainer"]>>;
+}
+
+/**
+ * Reach the shared stash without leaving a worker trapped below the base.
+ * Normal pathfinding gets the first attempt. When interventions are enabled,
+ * a failed approach uses spreadplayers at the stash X/Z so Minecraft chooses
+ * a safe surface Y, then makes one short final walk to the chests.
+ */
+async function reachStash(bot: Bot, stashPos: { x: number; y: number; z: number }): Promise<boolean> {
+  const target = new Vec3(stashPos.x, stashPos.y, stashPos.z);
+  const isNear = () => bot.entity.position.distanceTo(target) <= 7;
+  if (isNear()) return true;
+
+  try {
+    await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
+  } catch {
+    /* intervention fallback below */
+  }
+  if (isNear()) return true;
+  if (!config.bot.allowInterventions) return false;
+
+  console.log(`[Stash] ${bot.username} could not path to the stash — using safe surface rescue`);
+  bot.chat(`/spreadplayers ${stashPos.x} ${stashPos.z} 0 4 false ${bot.username}`);
+  await new Promise((resolve) => setTimeout(resolve, 2500));
+  await bot.waitForChunksToLoad().catch(() => {});
+
+  if (!isNear()) {
+    try {
+      await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 10000);
+    } catch {
+      /* command unavailable or the final few blocks are obstructed */
+    }
+  }
+  return isNear();
 }
 
 /** Stash row categories and their item patterns. Order matches physical chest rows. */
@@ -250,6 +285,55 @@ export function shouldKeep(
   return false;
 }
 
+export type DepositMode = "default" | "pantry";
+
+const PANTRY_FOOD = new Set([
+  "bread",
+  "cooked_beef",
+  "cooked_porkchop",
+  "cooked_mutton",
+  "cooked_chicken",
+  "cooked_cod",
+  "cooked_salmon",
+  "cooked_rabbit",
+  "baked_potato",
+  "apple",
+  "golden_apple",
+  "carrot",
+  "melon_slice",
+  "mushroom_stew",
+  "rabbit_stew",
+  "beetroot_soup",
+  "beef",
+  "porkchop",
+  "mutton",
+  "chicken",
+  "cod",
+  "salmon",
+  "rabbit",
+]);
+
+/**
+ * Determine how much of one inventory stack may be deposited. Pantry work is
+ * deliberately item-count based: keeping six *stacks* preserved Flora's
+ * entire 50-bread stack and made stock_food run 1,985 times for 29 items.
+ */
+export function depositCountForStack(
+  itemName: string,
+  stackCount: number,
+  keepItems: { name: string; minCount: number }[],
+  keptCounts: Map<string, number>,
+  mode: DepositMode = "default",
+): number {
+  if (mode !== "pantry") return shouldKeep(itemName, keepItems, keptCounts) ? 0 : stackCount;
+  if (!PANTRY_FOOD.has(itemName)) return 0;
+  const reserve = 3;
+  const alreadyKept = keptCounts.get("__pantry_food_items") ?? 0;
+  const keepFromStack = Math.min(stackCount, Math.max(0, reserve - alreadyKept));
+  keptCounts.set("__pantry_food_items", alreadyKept + keepFromStack);
+  return Math.max(0, stackCount - keepFromStack);
+}
+
 export { STASH_ROWS };
 
 /**
@@ -260,19 +344,13 @@ export async function depositStash(
   bot: Bot,
   stashPos: { x: number; y: number; z: number },
   keepItems: { name: string; minCount: number }[],
+  mode: DepositMode = "default",
 ): Promise<string> {
-  // Walk to stash area
-  await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
-
-  // Fail fast if we never actually reached the stash (underground / blocked /
-  // being chased). safeGoto returns after its 30s timeout WITHOUT throwing, so
-  // otherwise every downstream op — per-chest gotos + the 6-type food top-up
-  // loop, each a fresh withdrawStash with its own 30s goto — retries the same
-  // unreachable spot and their timeouts sum past the 150s action watchdog. This
-  // caused 16 deposit_stash hangs in 9 min when the team was stuck underground.
-  const distToStash = bot.entity.position.distanceTo(new Vec3(stashPos.x, stashPos.y, stashPos.z));
-  if (distToStash > 6) {
-    return `Can't reach the stash — ${distToStash.toFixed(0)} blocks away (blocked or underground). Get to the surface near ${stashPos.x},${stashPos.y},${stashPos.z} first.`;
+  if (!(await reachStash(bot, stashPos))) {
+    const distToStash = bot.entity.position.distanceTo(new Vec3(stashPos.x, stashPos.y, stashPos.z));
+    return `Can't reach the stash — ${distToStash.toFixed(0)} blocks away after walking${
+      config.bot.allowInterventions ? " and safe-surface rescue" : ""
+    }.`;
   }
 
   const itemsToDeposit = bot.inventory.items();
@@ -284,12 +362,14 @@ export async function depositStash(
   let noChest = 0;
 
   // Group items by category
-  const byCategory = new Map<string, typeof itemsToDeposit>();
+  type DepositCandidate = { item: (typeof itemsToDeposit)[number]; count: number };
+  const byCategory = new Map<string, DepositCandidate[]>();
   for (const item of itemsToDeposit) {
-    if (shouldKeep(item.name, keepItems, keptCounts)) continue;
+    const count = depositCountForStack(item.name, item.count, keepItems, keptCounts, mode);
+    if (count <= 0) continue;
     const cat = categorizeItem(item.name);
     if (!byCategory.has(cat)) byCategory.set(cat, []);
-    byCategory.get(cat)!.push(item);
+    byCategory.get(cat)!.push({ item, count });
   }
 
   // For each category, find nearest chest at the right row offset and deposit
@@ -317,10 +397,10 @@ export async function depositStash(
       // Use fallback chest
       try {
         const container = await openContainerTimed(bot, fallback);
-        for (const item of items) {
+        for (const candidate of items) {
           try {
-            await container.deposit(item.type, null, item.count);
-            deposited += item.count;
+            await container.deposit(candidate.item.type, null, candidate.count);
+            deposited += candidate.count;
           } catch {
             // Chest might be full
           }
@@ -336,10 +416,10 @@ export async function depositStash(
     try {
       await safeGoto(bot, new goals.GoalNear(chest.position.x, chest.position.y, chest.position.z, 2), 10000);
       const container = await openContainerTimed(bot, chest);
-      for (const item of items) {
+      for (const candidate of items) {
         try {
-          await container.deposit(item.type, null, item.count);
-          deposited += item.count;
+          await container.deposit(candidate.item.type, null, candidate.count);
+          deposited += candidate.count;
         } catch {
           // Chest full — this will trigger expansion request
         }
@@ -396,12 +476,14 @@ export async function depositStash(
         const placed = await placeChestNearStash(bot, stashPos);
         if (placed) {
           const container = await openContainerTimed(bot, placed);
+          const expansionKept = new Map<string, number>();
           for (const item of bot.inventory.items()) {
             if (item.name === "chest") continue; // keep spare chests for next expansion
-            if (shouldKeep(item.name, keepItems, keptCounts)) continue;
+            const count = depositCountForStack(item.name, item.count, keepItems, expansionKept, mode);
+            if (count <= 0) continue;
             try {
-              await container.deposit(item.type, null, item.count);
-              deposited += item.count;
+              await container.deposit(item.type, null, count);
+              deposited += count;
             } catch {
               break; // new chest full too
             }
@@ -424,7 +506,7 @@ export async function depositStash(
     .items()
     .filter((i) => i.name === "bread" || i.name.startsWith("cooked_"))
     .reduce((s, i) => s + i.count, 0);
-  if (foodHeld < 4) {
+  if (mode !== "pantry" && foodHeld < 4) {
     // Aggregate budget (LESSON 2): even though each withdrawStash is individually
     // bounded, looping all 6 food types re-runs the travel each time — cap the
     // whole top-up so it can't stall deposit_stash if the stash chest churns.
@@ -446,6 +528,9 @@ export async function depositStash(
   if (noChest > 0) {
     return `Deposited ${deposited} items. ${noChest} items couldn't fit — stash needs expansion.`;
   }
+  if (deposited === 0) {
+    return "Deposit complete: inventory contains only protected working reserves.";
+  }
   return `Deposited ${deposited} items at the stash.`;
 }
 
@@ -458,7 +543,12 @@ export async function withdrawStash(
   itemName: string,
   count: number,
 ): Promise<string> {
-  await safeGoto(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 3), 30000);
+  if (!(await reachStash(bot, stashPos))) {
+    const distToStash = bot.entity.position.distanceTo(new Vec3(stashPos.x, stashPos.y, stashPos.z));
+    return `Can't reach the stash — ${distToStash.toFixed(0)} blocks away after walking${
+      config.bot.allowInterventions ? " and safe-surface rescue" : ""
+    }.`;
+  }
 
   const category = categorizeItem(itemName);
 

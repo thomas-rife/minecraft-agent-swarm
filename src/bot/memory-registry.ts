@@ -29,3 +29,11 @@ export function getBotMemoryStore(bot: Bot): BotMemoryStore | undefined {
 export function getAllMemoryStores(): BotMemoryStore[] {
   return [...new Set(memStoreMap.values())];
 }
+
+export function getRegisteredBots(): Bot[] {
+  return [...memStoreMap.keys()];
+}
+
+export function unregisterBotMemory(bot: Bot): void {
+  memStoreMap.delete(bot);
+}

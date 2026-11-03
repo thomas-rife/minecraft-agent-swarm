@@ -14,6 +14,11 @@ export interface BotStatus {
   goal?: string;
   /** Result of the last action */
   lastResult?: string;
+  /** Compact item counts for shared settlement-state aggregation. */
+  inventory?: Record<string, number>;
+  /** Persistent decision-tree commitment, if any. */
+  objectiveId?: string;
+  subobjectiveId?: string;
 }
 
 const bulletin = new Map<string, BotStatus>();
@@ -46,7 +51,10 @@ export function formatTeamBulletin(excludeName: string): string {
     const pos = `(${Math.round(t.position.x)}, ${Math.round(t.position.y)}, ${Math.round(t.position.z)})`;
     const age = Math.round((Date.now() - t.timestamp) / 1000);
     const stale = age > 30 ? " [stale]" : "";
-    return `- ${t.name}: ${t.action} at ${pos} — "${t.thought}"${stale}`;
+    const commitment = t.objectiveId
+      ? ` | project=${t.objectiveId}${t.subobjectiveId ? ` → ${t.subobjectiveId}` : ""}`
+      : "";
+    return `- ${t.name}: ${t.action} at ${pos} — "${t.thought}"${commitment}${stale}`;
   });
 
   return `\nTEAM STATUS (live):\n${lines.join("\n")}`;

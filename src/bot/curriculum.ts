@@ -9,50 +9,75 @@
  */
 
 import type { Bot } from "mineflayer";
+import { FARM_SITE } from "./role.js";
 
 interface TechStage {
   name: string;
   /** Does the bot's inventory satisfy this stage? */
-  reached: (inv: Set<string>, counts: Map<string, number>) => boolean;
+  reached: (inv: Set<string>, counts: Map<string, number>, facts: TechFacts) => boolean;
   /** Concrete suggestion for how to reach this stage (shown when it's next). */
   suggestion: string;
 }
+
+interface TechFacts {
+  nearbyCraftingTable: boolean;
+}
+
+const hasToolTier = (inv: Set<string>, minimumTier: number): boolean => {
+  // Gold tools are not a progression upgrade: they cannot mine stone-tier
+  // blocks despite their speed, so treat them like wood for milestone checks.
+  const rank: Record<string, number> = { wooden: 0, golden: 0, stone: 1, iron: 2, diamond: 3, netherite: 4 };
+  return [...inv].some((name) => {
+    const match = name.match(/^(wooden|stone|iron|golden|diamond|netherite)_(pickaxe|axe|shovel|hoe|sword)$/);
+    return !!match && rank[match[1]] >= minimumTier;
+  });
+};
 
 /** Ordered ladder — the first unreached stage is the proposed next goal. */
 const TECH_LADDER: TechStage[] = [
   {
     name: "wood",
-    reached: (inv) => [...inv].some((n) => n.endsWith("_log") || n.endsWith("_planks")),
+    reached: (inv, _counts, facts) =>
+      [...inv].some((n) => n.endsWith("_log") || n.endsWith("_planks")) ||
+      facts.nearbyCraftingTable ||
+      hasToolTier(inv, 0),
     suggestion: "gather_wood to collect logs",
   },
   {
     name: "crafting table",
-    reached: (inv) => inv.has("crafting_table"),
+    // A crafted tool proves the table milestone was completed even if the
+    // table was placed and is no longer an inventory item.
+    reached: (inv, _counts, facts) => inv.has("crafting_table") || facts.nearbyCraftingTable || hasToolTier(inv, 0),
     suggestion: 'craft {"item":"crafting_table"} (needs 4 planks — craft planks from logs first)',
   },
   {
     name: "wooden tools",
-    reached: (inv) => [...inv].some((n) => n.startsWith("wooden_")),
+    reached: (inv) => hasToolTier(inv, 0),
     suggestion: 'craft {"item":"wooden_pickaxe"} (3 planks + 2 sticks)',
   },
   {
     name: "stone tools",
-    reached: (inv) => [...inv].some((n) => n.startsWith("stone_") && n !== "stone"),
+    reached: (inv) => hasToolTier(inv, 1),
     suggestion: 'mine_block {"blockType":"stone"} x3 then craft {"item":"stone_pickaxe"}',
   },
   {
     name: "furnace",
-    reached: (inv) => inv.has("furnace"),
+    reached: (inv) =>
+      inv.has("furnace") ||
+      inv.has("iron_ingot") ||
+      [...inv].some((n) => /^(iron|diamond|netherite)_/.test(n)),
     suggestion: 'craft {"item":"furnace"} (8 cobblestone)',
   },
   {
     name: "iron",
-    reached: (inv) => inv.has("iron_ingot") || [...inv].some((n) => n.startsWith("iron_") && n !== "iron_ore"),
+    reached: (inv) =>
+      inv.has("iron_ingot") ||
+      [...inv].some((n) => /^(iron|diamond|netherite)_/.test(n) && n !== "iron_ore"),
     suggestion: 'mine_block {"blockType":"iron_ore"} (need stone pickaxe), then smelt_ores',
   },
   {
     name: "iron tools",
-    reached: (inv) => [...inv].some((n) => n.startsWith("iron_") && n !== "iron_ingot" && n !== "iron_ore"),
+    reached: (inv) => hasToolTier(inv, 2),
     suggestion: 'craft {"item":"iron_pickaxe"} (3 iron ingots + 2 sticks)',
   },
   {
@@ -66,7 +91,8 @@ const TECH_LADDER: TechStage[] = [
 const FARM_LADDER: TechStage[] = [
   {
     name: "wood for the hoe",
-    reached: (inv) => [...inv].some((n) => n.endsWith("_log") || n.endsWith("_planks")),
+    reached: (inv) =>
+      [...inv].some((n) => n.endsWith("_log") || n.endsWith("_planks") || n.endsWith("_hoe")),
     suggestion: "gather_wood (or ask a teammate to give_item planks)",
   },
   {
@@ -82,7 +108,7 @@ const FARM_LADDER: TechStage[] = [
   {
     name: "the farm",
     reached: () => false, // completion is recorded by the skill itself; keep pushing
-    suggestion: "go_to the irrigation bed at (290, 71, -312), then invoke_skill build_farm — water is there",
+    suggestion: `go_to the shared farm search area at (${FARM_SITE.x}, ${FARM_SITE.y}, ${FARM_SITE.z}), then invoke_skill build_farm`,
   },
 ];
 
@@ -127,11 +153,22 @@ export function getTechTreeLine(bot: Bot, role?: string): string {
     return "";
   }
 
+  let nearbyCraftingTable = false;
+  try {
+    nearbyCraftingTable = !!bot.findBlock({
+      matching: (block) => block.name === "crafting_table",
+      maxDistance: 32,
+    });
+  } catch {
+    // Inventory/downstream outputs still provide conservative evidence.
+  }
+  const facts: TechFacts = { nearbyCraftingTable };
+
   const ladder = (role && ROLE_LADDERS[role]) || TECH_LADDER;
   const reached: string[] = [];
   let next: TechStage | null = null;
   for (const stage of ladder) {
-    if (stage.reached(inv, counts)) {
+    if (stage.reached(inv, counts, facts)) {
       reached.push(stage.name);
     } else if (!next) {
       next = stage;

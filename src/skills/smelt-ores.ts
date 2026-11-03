@@ -5,15 +5,19 @@ import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { withdrawStash } from "./stash.js";
+import { getBotMemoryStore } from "../bot/memory-registry.js";
 
 /** Items that can be smelted: input → output name. */
 const SMELT_RECIPES: Record<string, string> = {
   raw_iron: "iron_ingot",
   iron_ore: "iron_ingot",
+  deepslate_iron_ore: "iron_ingot",
   raw_gold: "gold_ingot",
   gold_ore: "gold_ingot",
+  deepslate_gold_ore: "gold_ingot",
   raw_copper: "copper_ingot",
   copper_ore: "copper_ingot",
+  deepslate_copper_ore: "copper_ingot",
   sand: "glass",
 };
 
@@ -66,6 +70,14 @@ export const smeltOresSkill: Skill = {
     // hand-off mechanism — not a cheat).
     const stashPos = params?.stashPos as { x: number; y: number; z: number } | undefined;
     if (stashPos && !signal.aborted) {
+      // Metalworking is a shared settlement station. Always converge on the
+      // stash before locating or placing a furnace so later bots can reuse it.
+      setMovements(bot);
+      try {
+        await gotoTimed(bot, new goals.GoalNear(stashPos.x, stashPos.y, stashPos.z, 4), 20000);
+      } catch {
+        /* withdrawal and furnace discovery below still get a chance */
+      }
       // TIME BUDGET: each withdrawStash re-walks to the stash (safeGoto up to
       // 30s). Looping all 6 ore + 2 fuel types when the stash is EMPTY (common —
       // ore production is low) meant 8 x 30s ≈ 240s → the skill watchdog fired
@@ -76,7 +88,17 @@ export const smeltOresSkill: Skill = {
       const budgetLeft = () => Date.now() - wdStart < 30000;
       const haveSmeltable = Object.keys(SMELT_RECIPES).some((n) => countInv(n) > 0);
       if (!haveSmeltable) {
-        for (const ore of ["raw_iron", "iron_ore", "raw_copper", "copper_ore", "raw_gold", "gold_ore"]) {
+        for (const ore of [
+          "raw_iron",
+          "iron_ore",
+          "deepslate_iron_ore",
+          "raw_copper",
+          "copper_ore",
+          "deepslate_copper_ore",
+          "raw_gold",
+          "gold_ore",
+          "deepslate_gold_ore",
+        ]) {
           if (!budgetLeft()) break;
           try {
             await withdrawStash(bot, stashPos, ore, 16);
@@ -209,6 +231,17 @@ export const smeltOresSkill: Skill = {
         return { success: false, message: "Couldn't place furnace. Try in a flatter area." };
       }
     }
+
+    // Persist the workstation independently of whether this particular ore
+    // batch later completes. The placed/observed furnace is durable world
+    // progression and future work orders should navigate back to base to use it.
+    getBotMemoryStore(bot)?.addStructure(
+      "furnace",
+      furnaceBlock.position.x,
+      furnaceBlock.position.y,
+      furnaceBlock.position.z,
+      "Shared furnace station; status=established",
+    );
 
     // --- Step 4: Navigate to furnace ---
     setMovements(bot);

@@ -13,7 +13,14 @@ import { depositStash, withdrawStash } from "../skills/stash.js";
 import { config } from "../config.js";
 
 import { STASH_POS } from "./role.js";
-import { safeMoves, explorerMoves, safeGoto, collectNearbyDrops } from "./navigation.js";
+import {
+  safeMoves,
+  explorerMoves,
+  safeGoto,
+  collectNearbyDrops,
+  escapeToSurface,
+  getSurfaceState,
+} from "./navigation.js";
 export { safeMoves, explorerMoves, safeGoto, collectNearbyDrops };
 
 /** Hard cap for a single DIRECT action. Longer than any legit action (gather
@@ -189,7 +196,7 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
         const stashPos = params.stashPos;
         const keepItems = params.keepItems;
         if (!stashPos) return "No stash position configured.";
-        return await depositStash(bot, stashPos, keepItems ?? []);
+        return await depositStash(bot, stashPos, keepItems ?? [], params.mode === "pantry" ? "pantry" : "default");
       }
       case "withdraw_stash": {
         const stashPos = params.stashPos;
@@ -218,6 +225,202 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
  *  of evidence shows it can't reach trunks even from 3 blocks away. */
 const WOOD_LEASH_RADIUS = 200;
 
+function treeApproachGoal(bot: Bot, basePos: Vec3, allowLeafClearing: boolean): any {
+  const standGoals: InstanceType<typeof goals.GoalBlock>[] = [];
+  const yOffsets = [0, 1, -1];
+
+  // Give A* explicit, physically valid places to stand around the trunk.
+  // GoalNear can be "satisfied" by a vertically close but unusable canopy or
+  // can keep aiming at the trunk's occupied coordinate. A composite of real
+  // feet/head-clear cells lets pathfinder choose the reachable side.
+  for (let radius = 1; radius <= 3; radius++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dz = -radius; dz <= radius; dz++) {
+        if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) continue;
+        for (const dy of yOffsets) {
+          const stand = basePos.offset(dx, dy, dz);
+          const feet = bot.blockAt(stand);
+          const head = bot.blockAt(stand.offset(0, 1, 0));
+          const ground = bot.blockAt(stand.offset(0, -1, 0));
+          const canClear = (block: typeof feet) =>
+            !!block && (block.boundingBox === "empty" || (allowLeafClearing && block.name.endsWith("_leaves")));
+          if (!canClear(feet) || !canClear(head)) continue;
+          if (!ground || ground.boundingBox !== "block" || ground.name === "water" || ground.name === "lava") continue;
+          standGoals.push(new goals.GoalBlock(stand.x, stand.y, stand.z));
+          break;
+        }
+      }
+    }
+  }
+
+  return standGoals.length > 0
+    ? new goals.GoalCompositeAny(standGoals)
+    : new goals.GoalNear(basePos.x, basePos.y, basePos.z, allowLeafClearing ? 2 : 3);
+}
+
+const TREE_SCAN_HORIZONTAL_RADIUS = 6;
+const TREE_SCAN_VERTICAL_LIMIT = 24;
+const TREE_SCAN_MAX_LOGS = 96;
+
+export interface TreePlan {
+  logName: string;
+  logs: Vec3[];
+  plantingSpots: Vec3[];
+  saplingName?: string;
+}
+
+function positionKey(pos: Vec3): string {
+  return `${pos.x},${pos.y},${pos.z}`;
+}
+
+/** Map a natural trunk to the item that can regrow it. */
+export function saplingForLog(logName: string): string | undefined {
+  if (logName === "mangrove_log") return "mangrove_propagule";
+  if (!logName.endsWith("_log")) return undefined;
+  return `${logName.slice(0, -"_log".length)}_sapling`;
+}
+
+function isTreeSeedItem(itemName: string): boolean {
+  return itemName.endsWith("_sapling") || itemName === "mangrove_propagule";
+}
+
+/**
+ * Capture one whole tree before the first block is removed. Following the
+ * connected log component finds tall trunks and sideways/diagonal large-oak
+ * branches that the old straight-column loop left floating. The radius and
+ * count caps prevent two touching forests from becoming one unbounded job.
+ */
+export function planConnectedTree(
+  blockAt: (position: Vec3) => { name: string } | null,
+  basePos: Vec3,
+  logName: string,
+): TreePlan {
+  const queue = [basePos.clone()];
+  const queued = new Set([positionKey(basePos)]);
+  const logs: Vec3[] = [];
+
+  while (queue.length > 0 && logs.length < TREE_SCAN_MAX_LOGS) {
+    const current = queue.shift()!;
+    const block = blockAt(current);
+    if (!block || block.name !== logName) continue;
+    logs.push(current.clone());
+
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dy === 0 && dz === 0) continue;
+          const next = current.offset(dx, dy, dz);
+          // The seed may itself be a sideways canopy branch returned by
+          // findBlocks, so trace both downward to the roots and upward to the
+          // crown before selecting the true planting level.
+          if (next.y < basePos.y - TREE_SCAN_VERTICAL_LIMIT || next.y > basePos.y + TREE_SCAN_VERTICAL_LIMIT) continue;
+          if (
+            Math.abs(next.x - basePos.x) > TREE_SCAN_HORIZONTAL_RADIUS ||
+            Math.abs(next.z - basePos.z) > TREE_SCAN_HORIZONTAL_RADIUS
+          ) {
+            continue;
+          }
+          const key = positionKey(next);
+          if (queued.has(key)) continue;
+          queued.add(key);
+          if (blockAt(next)?.name === logName) queue.push(next);
+        }
+      }
+    }
+  }
+
+  const lowestY = logs.reduce((lowest, pos) => Math.min(lowest, pos.y), basePos.y);
+  const plantingSpots = logs
+    .filter((pos) => pos.y === lowestY)
+    .filter((pos) => {
+      const ground = blockAt(pos.offset(0, -1, 0));
+      return (
+        !!ground &&
+        ["grass_block", "dirt", "podzol", "rooted_dirt", "mud", "moss_block", "mycelium"].includes(ground.name)
+      );
+    })
+    .map((pos) => pos.clone());
+
+  return {
+    logName,
+    logs,
+    plantingSpots,
+    saplingName: saplingForLog(logName),
+  };
+}
+
+function treeCanopyMovements(bot: Bot, logTypes: readonly string[]): InstanceType<typeof Movements> {
+  const moves = new Movements(bot);
+  moves.canDig = true;
+  moves.allow1by1towers = true;
+  moves.allowParkour = false;
+  moves.maxDropDown = 3;
+  moves.dontCreateFlow = true;
+  moves.dontMineUnderFallingBlock = true;
+  // Canopy access may clear leaves and logs, but should not tunnel through the
+  // settlement or terrain just to reach the top of a tree.
+  moves.exclusionAreasBreak.push((block) =>
+    block.name.endsWith("_leaves") || logTypes.includes(block.name) ? 0 : 100,
+  );
+  return moves;
+}
+
+async function fellPlannedTree(
+  bot: Bot,
+  plan: TreePlan,
+  logTypes: readonly string[],
+  deadline: number,
+): Promise<{ chopped: number; remaining: number }> {
+  const initialCount = plan.logs.length;
+  let routeAttempts = 0;
+
+  while (Date.now() < deadline) {
+    const remainingBlocks = plan.logs
+      .map((position) => bot.blockAt(position))
+      .filter((block): block is NonNullable<typeof block> => !!block && block.name === plan.logName);
+    if (remainingBlocks.length === 0) return { chopped: initialCount, remaining: 0 };
+
+    const reachable = remainingBlocks
+      .filter((block) =>
+        typeof bot.canDigBlock === "function"
+          ? bot.canDigBlock(block)
+          : block.position.distanceTo(bot.entity.position) <= 4.5,
+      )
+      .sort(
+        (a, b) =>
+          a.position.y - b.position.y ||
+          a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position),
+      );
+
+    if (reachable.length > 0) {
+      await digSafe(bot, reachable[0]);
+      routeAttempts = 0;
+      continue;
+    }
+
+    // The remaining top/branch is beyond survival reach. Pathfinder can walk
+    // through leaves or use carried dirt/cobblestone as a bounded scaffold to
+    // reach a visible block face. It does not break the target for us.
+    if (routeAttempts >= 6 || Date.now() + 12_000 >= deadline) break;
+    routeAttempts++;
+    const target = remainingBlocks.sort(
+      (a, b) =>
+        a.position.y - b.position.y ||
+        a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position),
+    )[0];
+    bot.pathfinder.setMovements(treeCanopyMovements(bot, logTypes));
+    try {
+      await safeGoto(bot, new goals.GoalLookAtBlock(target.position, bot.world, { reach: 4.5 }), 12_000, 6_000);
+    } catch {
+      // Re-evaluate the component: pathfinding may have cleared obstructing
+      // leaves/logs before failing, or another face may now be reachable.
+    }
+  }
+
+  const remaining = plan.logs.filter((position) => bot.blockAt(position)?.name === plan.logName).length;
+  return { chopped: initialCount - remaining, remaining };
+}
+
 async function gatherWood(bot: Bot, count: number): Promise<string> {
   // Use shared LOG_TYPES so pale_oak_log (MC 1.21.4) and future wood types are included
   const logTypes = LOG_TYPES as readonly string[];
@@ -237,6 +440,24 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
     );
     bot.chat(`/spreadplayers ${STASH_POS.x} ${STASH_POS.z} 0 24 false ${bot.username}`);
     await new Promise((r) => setTimeout(r, 4000));
+  }
+
+  // Resolve a covered base/mine position before selecting a tree. Previously
+  // gather_wood spent 30 seconds trying an impossible trunk route, then tried
+  // surface escape once with most of its time budget already gone. Search a
+  // wider bounded area up front; if the player-enabled rescue mode is active,
+  // use the existing safe spreadplayers intervention as a final extraction.
+  if (!getSurfaceState(bot).hasDirectSky) {
+    const escape = await escapeToSurface(bot, 64);
+    console.log(
+      `[GatherDebug] preflight surface escape: bot=${bot.username} method=${escape.method} escaped=${escape.escaped} detail=${escape.detail}`,
+    );
+    if (!escape.escaped && config.bot.allowInterventions) {
+      console.log(`[GatherDebug] enclosed-base rescue: ${bot.username} — TPing to safe surface near base`);
+      bot.chat(`/spreadplayers ${STASH_POS.x} ${STASH_POS.z} 0 24 false ${bot.username}`);
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      await bot.waitForChunksToLoad().catch(() => {});
+    }
   }
 
   // Collect all nearby logs — use 256 block radius to find trees even after local depletion
@@ -261,21 +482,6 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // dist<20 candidates existed).
   allLogs.sort((a, b) => a.distanceTo(bot.entity.position) - b.distanceTo(bot.entity.position));
 
-  // If underground, surface first — explorerMoves can't dig through solid blocks
-  if (bot.entity.position.y < 63) {
-    const digMoves = new Movements(bot);
-    digMoves.canDig = true;
-    digMoves.allowFreeMotion = true;
-    digMoves.allow1by1towers = true;
-    bot.pathfinder.setMovements(digMoves);
-    try {
-      await safeGoto(bot, new goals.GoalY(70), 20000);
-    } catch {
-      /* best effort — continue anyway */
-    }
-    bot.pathfinder.setMovements(explorerMoves(bot));
-  }
-
   const countLogsInInventory = () =>
     bot.inventory
       .items()
@@ -285,7 +491,7 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
 
   let gathered = 0;
   let tried = 0;
-  const chopSpots: Vec3[] = []; // ground positions to replant saplings on
+  const chopSpots: { position: Vec3; saplingName?: string; requireExact: boolean }[] = [];
   // Aggregate travel budget: the old design allowed 4 tries x 90s per-tree goto
   // = 360s of pathing, which now trips the 150s action watchdog and hard-kills
   // the action mid-dig (Atlas/Forge hit it 4x in 10 min chasing far trees).
@@ -293,31 +499,27 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // thinkTimeout via the finally) well before the watchdog fires. 110s + one
   // 30s goto = 140s < 150s.
   const gatherStart = Date.now();
+  let surfaceEscapeAttempted = false;
+  const failureReasons: string[] = [];
   for (const pos of allLogs) {
     if (gathered >= count) break;
     if (Date.now() - gatherStart > 110000) break;
-    let log = bot.blockAt(pos);
+    const log = bot.blockAt(pos);
     if (!log || !(logTypes as readonly string[]).includes(log.name)) continue;
 
-    // Target the BASE of the trunk, not whatever log findBlocks returned.
-    // Big oaks return canopy BRANCH logs 8-10 blocks up — GoalNear(3) can
-    // never be satisfied from the ground for those (instrumentation showed
-    // repeated failures with the tree DIRECTLY OVERHEAD at dist 8-10), and
-    // chopping a canopy log rains its drops into the leaves. Walk the log
-    // column down to ground level and approach that instead.
-    let below = bot.blockAt(log.position.offset(0, -1, 0));
-    while (below && (logTypes as readonly string[]).includes(below.name)) {
-      log = below;
-      below = bot.blockAt(log.position.offset(0, -1, 0));
-    }
-    const basePos = log.position;
+    // Target the true root of the connected tree, not whichever canopy branch
+    // findBlocks returned. The plan is captured before any digging so branch
+    // logs cannot disappear from the job as the trunk is removed.
+    const treePlan = planConnectedTree((position) => bot.blockAt(position), log.position, log.name);
+    const basePos = treePlan.plantingSpots[0];
     // Skip FLOATING tree remnants: weeks of old one-log chopping left
     // trunk-tops hovering over air everywhere, and they bait the finder into
     // unreachable targets (evidence: base at y=82 with the bot directly
     // below at y=74). A real trunk base sits on a solid block.
-    if (!below || below.name === "air" || below.name === "water") continue;
+    if (!basePos) continue;
 
     tried++;
+    let stage = "approach";
     try {
       // explorerMoves allows swimming — essential when trees are across water
       bot.pathfinder.setMovements(explorerMoves(bot));
@@ -338,61 +540,97 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
         // entirely, which is why regrown clumpy forests still starved us after
         // the retry was added. Swallow the first failure; the dig retry below
         // is the real fallback either way.
+        let cleanApproachError: unknown = null;
         try {
-          await safeGoto(bot, new goals.GoalNear(basePos.x, basePos.y, basePos.z, 3), 30000, 12000);
-        } catch {
-          /* fall through to the dig-enabled retry */
+          await safeGoto(bot, treeApproachGoal(bot, basePos, false), 30000, 12000);
+        } catch (err) {
+          cleanApproachError = err;
         }
+
+        // A roofed position is not automatically a cave: it may be the team's
+        // house. Only escalate after the tree route actually fails. The shared
+        // surface check then tries a door/walkable outdoor cell before it
+        // permits protected natural-terrain digging.
+        if (
+          bot.entity.position.distanceTo(new Vec3(basePos.x, basePos.y, basePos.z)) > 4.5 &&
+          !surfaceEscapeAttempted &&
+          !getSurfaceState(bot).hasDirectSky
+        ) {
+          stage = "surface_escape";
+          surfaceEscapeAttempted = true;
+          const escape = await escapeToSurface(bot);
+          const initialFailure =
+            cleanApproachError instanceof Error
+              ? `${cleanApproachError.name}: ${cleanApproachError.message}`
+              : String(cleanApproachError);
+          console.log(
+            `[GatherDebug] surface escape: bot=${bot.username} initial=${initialFailure} method=${escape.method} escaped=${escape.escaped} detail=${escape.detail}`,
+          );
+          if (escape.escaped) {
+            // The leaf-capable retry below can also use a completely clean
+            // path, so do not spend another 30s repeating the same no-dig
+            // approach. This keeps worst-case gather_wood under its watchdog.
+            bot.pathfinder.setMovements(explorerMoves(bot));
+          }
+        }
+
         // Young regrown trees sit inside ground-level leaf bushes that the
         // no-dig movement can't push through — at the regrown forest EVERY
         // approach failed ("Couldn't reach any trees... pathfinding failed").
         // If we're still not adjacent, retry once with digging allowed: the
         // bot chews through the bush exactly like a player would.
         if (bot.entity.position.distanceTo(new Vec3(basePos.x, basePos.y, basePos.z)) > 4.5) {
+          stage = "leaf_bush_retry";
           const bushMoves = new Movements(bot);
           bushMoves.canDig = true;
           bushMoves.allow1by1towers = false;
           bushMoves.maxDropDown = 3;
           bushMoves.allowParkour = false;
+          bushMoves.dontCreateFlow = true;
+          bushMoves.dontMineUnderFallingBlock = true;
+          // This retry exists specifically for ground-level leaf bushes. Do
+          // not let a route to a distant tree turn into unrestricted tunneling
+          // through the base or terrain.
+          bushMoves.exclusionAreasBreak.push((block) => (block.name.endsWith("_leaves") ? 0 : 100));
           bot.pathfinder.setMovements(bushMoves);
-          await safeGoto(bot, new goals.GoalNear(basePos.x, basePos.y, basePos.z, 2), 20000, 8000);
+          await safeGoto(bot, treeApproachGoal(bot, basePos, true), 20000, 8000);
         }
-        await digSafe(bot, log);
-        gathered++;
-        // Fell the WHOLE trunk, not just one block: logs above float (classic
-        // Minecraft) and their drops rain down the cleared column to walkable
-        // ground. Chopping a single log left drops lodged in the canopy — 78%
-        // of chopped logs were lost as unreachable (1138 lost vs 326 gathered).
-        let above = bot.blockAt(basePos.offset(0, 1, 0));
-        let felled = 0;
-        // Cap 12, not 6: a 6-cap left the tops of tall oaks floating, and those
-        // remnants are exactly what poisons the finder (see count comment above).
-        while (above && (logTypes as readonly string[]).includes(above.name) && felled < 12) {
-          try {
-            await digSafe(bot, above);
-            felled++;
-          } catch {
-            break; // out of dig reach — the rest of the trunk stays
+        stage = "whole_tree_fell";
+        const fell = await fellPlannedTree(bot, treePlan, logTypes, gatherStart + 110_000);
+        gathered += fell.chopped;
+        if (fell.remaining === 0) {
+          for (const position of treePlan.plantingSpots) {
+            chopSpots.push({
+              position,
+              saplingName: treePlan.saplingName,
+              requireExact: treePlan.plantingSpots.length > 1,
+            });
           }
-          above = bot.blockAt(above.position.offset(0, 1, 0));
+        } else {
+          failureReasons.push(`whole_tree_fell: ${fell.remaining} logs remained`);
+          console.log(
+            `[GatherDebug] partial tree at (${basePos.x},${basePos.y},${basePos.z}): chopped=${fell.chopped} remaining=${fell.remaining}`,
+          );
         }
-        gathered += felled;
-        chopSpots.push(basePos.clone()); // remember the trunk spot to replant on
         // Walk over the drops — digging alone leaves the items on the ground
+        stage = "drop_collection";
         await new Promise((r) => setTimeout(r, 600));
         await collectNearbyDrops(bot, 8, 9000);
       } finally {
         clearInterval(yGuard);
         bot.pathfinder.thinkTimeout = prevThinkTimeout;
       }
-    } catch {
+    } catch (err) {
       // This log was unreachable — skip it and try the next one.
       // INSTRUMENTATION (wood-economy debugging): record exactly where the
       // approach fails so the fix targets evidence, not guesses — 80% of
       // gathers still die here even after the leaf-dig retry.
       const bp = bot.entity.position;
+      const errorName = err instanceof Error ? err.name : "UnknownError";
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      failureReasons.push(`${stage}: ${errorName}`);
       console.log(
-        `[GatherDebug] approach failed: bot(${bp.x.toFixed(0)},${bp.y.toFixed(0)},${bp.z.toFixed(0)}) -> base(${basePos.x},${basePos.y},${basePos.z}) dist=${bp.distanceTo(basePos).toFixed(0)}`,
+        `[GatherDebug] failed stage=${stage} error=${errorName}: ${errorMessage} bot(${bp.x.toFixed(0)},${bp.y.toFixed(0)},${bp.z.toFixed(0)}) -> base(${basePos.x},${basePos.y},${basePos.z}) dist=${bp.distanceTo(basePos).toFixed(0)}`,
       );
     }
     if (tried >= 4 && gathered === 0) break; // give up after 4 failed attempts (~120s max)
@@ -418,7 +656,7 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // with no saplings AND no reachable trees is doubly stuck (182 fails/hour
   // with zero plantings — the seeds have to come from somewhere). The team
   // stash banks saplings from richer times; withdraw a handful first.
-  if (!bot.inventory.items().some((i) => i.name.endsWith("_sapling"))) {
+  if (!bot.inventory.items().some((i) => isTreeSeedItem(i.name))) {
     try {
       await withdrawStash(bot, STASH_POS, "sapling", 8);
     } catch {
@@ -428,7 +666,8 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   const seeded = await scatterSaplings(bot, 4);
   if (seeded > 0)
     return `Couldn't reach any trees, so planted ${seeded} sapling${seeded > 1 ? "s" : ""} on open ground instead — they'll grow. Do other work and gather later.`;
-  return "Couldn't reach any trees this attempt (pathfinding failed). Stay near base and try again — do NOT explore far for wood.";
+  const reason = failureReasons.length > 0 ? ` Failure details: ${[...new Set(failureReasons)].join(", ")}.` : "";
+  return `Couldn't reach any trees this attempt.${reason} Stay near base and try again — do NOT explore far for wood.`;
 }
 
 /**
@@ -436,25 +675,31 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
  * forest regrows. Plants up to as many saplings as the bot is carrying.
  * Returns the number planted.
  */
-async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
-  const saplings = bot.inventory.items().filter((i) => i.name.endsWith("_sapling"));
+async function replantSaplings(
+  bot: Bot,
+  chopSpots: { position: Vec3; saplingName?: string; requireExact: boolean }[],
+): Promise<number> {
+  const saplings = bot.inventory.items().filter((i) => isTreeSeedItem(i.name));
   if (saplings.length === 0 || chopSpots.length === 0) return 0;
-  let sapling = saplings[0];
   let planted = 0;
 
-  for (const spot of chopSpots) {
-    if (sapling.count <= 0) {
-      const next = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
-      if (!next) break;
-      sapling = next;
-    }
+  for (const planned of chopSpots) {
+    const spot = planned.position;
+    // Preserve species when possible (especially 2x2 dark-oak/jungle/spruce
+    // trunks). Falling back to any sapling is better than permanent
+    // deforestation when the matching leaves have not decayed yet.
+    const matching = bot.inventory.items().find((i) => i.name === planned.saplingName);
+    const sapling =
+      matching ?? (planned.requireExact ? undefined : bot.inventory.items().find((i) => isTreeSeedItem(i.name)));
+    if (!sapling) continue;
     // The trunk base sat on grass/dirt; plant on that ground block (one below
     // the lowest log) by placing against it with the sapling occupying the
     // log's old space.
     const ground = bot.blockAt(spot.offset(0, -1, 0));
     const target = bot.blockAt(spot);
     if (!ground || !target) continue;
-    if (!["grass_block", "dirt", "podzol", "rooted_dirt"].includes(ground.name)) continue;
+    if (!["grass_block", "dirt", "podzol", "rooted_dirt", "mud", "moss_block", "mycelium"].includes(ground.name))
+      continue;
     if (target.name !== "air") continue;
     try {
       if (bot.entity.position.distanceTo(spot) > 4) {
@@ -463,7 +708,6 @@ async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
       await bot.equip(sapling, "hand");
       await bot.placeBlock(ground, new Vec3(0, 1, 0));
       planted++;
-      sapling = { ...sapling, count: sapling.count - 1 } as typeof sapling;
     } catch {
       // couldn't place here — try the next spot
     }
@@ -485,7 +729,7 @@ async function replantSaplings(bot: Bot, chopSpots: Vec3[]): Promise<number> {
  * the forest must sustain itself without outside gardening.
  */
 async function scatterSaplings(bot: Bot, max: number): Promise<number> {
-  let sapling = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
+  let sapling = bot.inventory.items().find((i) => isTreeSeedItem(i.name));
   if (!sapling) return 0;
 
   const isClearAround = (pos: Vec3): boolean => {
@@ -524,7 +768,7 @@ async function scatterSaplings(bot: Bot, max: number): Promise<number> {
       }
       const ground = bot.blockAt(g);
       if (!ground) continue;
-      sapling = bot.inventory.items().find((i) => i.name.endsWith("_sapling"));
+      sapling = bot.inventory.items().find((i) => isTreeSeedItem(i.name));
       if (!sapling) break;
       await bot.equip(sapling, "hand");
       await bot.placeBlock(ground, new Vec3(0, 1, 0));
@@ -539,7 +783,7 @@ async function scatterSaplings(bot: Bot, max: number): Promise<number> {
   if (planted === 0) {
     const sapCount = bot.inventory
       .items()
-      .filter((i) => i.name.endsWith("_sapling"))
+      .filter((i) => isTreeSeedItem(i.name))
       .reduce((s, i) => s + i.count, 0);
     console.log(`[ForestryDebug] scatter planted 0: ${grounds.length} ground candidates, ${sapCount} saplings held`);
   }
@@ -567,20 +811,26 @@ function blockMatcher(blockType: string): { match: (name: string) => boolean; is
  *  bot can't quite reach, a server hiccup) otherwise blocks the brain until the
  *  150s action watchdog fires. mine_block was the top residual watchdog trip
  *  (8 in 11h) from exactly this; stopDigging + reject lets it fail fast. */
-async function digSafe(bot: Bot, block: import("prismarine-block").Block): Promise<void> {
-  await Promise.race([
-    bot.dig(block),
-    new Promise<void>((_, rej) =>
-      setTimeout(() => {
-        try {
-          bot.stopDigging();
-        } catch {
-          /* wasn't digging */
-        }
-        rej(new Error("dig timeout"));
-      }, 12000),
-    ),
-  ]);
+export async function digSafe(bot: Bot, block: import("prismarine-block").Block): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      bot.dig(block),
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => {
+          try {
+            bot.stopDigging();
+          } catch {
+            /* wasn't digging */
+          }
+          reject(new Error("dig timeout"));
+        }, 12000);
+      }),
+    ]);
+  } finally {
+    // A completed dig must not cancel the next dig twelve seconds later.
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function mineBlock(
@@ -939,7 +1189,18 @@ const CRAFT_ALIASES: Record<string, string> = {
   bed: "red_bed",
 };
 
+export function craftExecutionsForOutput(desiredOutput: number, outputPerCraft: number): number {
+  const desired = Math.max(1, Math.floor(Number(desiredOutput) || 1));
+  const batch = Math.max(1, Math.floor(Number(outputPerCraft) || 1));
+  return Math.ceil(desired / batch);
+}
+
 async function craftItem(bot: Bot, itemName: string, count: number): Promise<string> {
+  // Public action counts are desired OUTPUT items. Mineflayer's bot.craft
+  // count is recipe executions, and recipes such as sticks/torches/planks
+  // output four at a time. Passing the LLM's count through directly caused
+  // "craft 16 torches" to create 64 and filled inventories with stick stacks.
+  const desiredOutput = Math.max(1, Math.min(Math.floor(Number(count) || 1), 128));
   // Resolve aliases
   const resolvedName = CRAFT_ALIASES[itemName] || itemName;
   const mcData = (await import("minecraft-data")).default(bot.version);
@@ -953,11 +1214,11 @@ async function craftItem(bot: Bot, itemName: string, count: number): Promise<str
   });
 
   // Try recipe with crafting table first (supports 3x3), fall back to hand (2x2)
-  let recipe = craftingTable ? bot.recipesFor(item.id, null, 1, craftingTable)[0] : null;
+  let recipe = craftingTable ? bot.recipesFor(item.id, null, desiredOutput, craftingTable)[0] : null;
 
   if (!recipe) {
     // Try 2x2 hand recipe
-    recipe = bot.recipesFor(item.id, null, 1, null)[0];
+    recipe = bot.recipesFor(item.id, null, desiredOutput, null)[0];
   }
 
   if (!recipe && !craftingTable) {
@@ -976,7 +1237,7 @@ async function craftItem(bot: Bot, itemName: string, count: number): Promise<str
             maxDistance: 8,
           });
           if (craftingTable) {
-            recipe = bot.recipesFor(item.id, null, 1, craftingTable)[0];
+            recipe = bot.recipesFor(item.id, null, desiredOutput, craftingTable)[0];
           }
         } catch {
           // Placement failed, continue without table
@@ -1004,8 +1265,8 @@ async function craftItem(bot: Bot, itemName: string, count: number): Promise<str
             }
             // Re-check recipe after getting planks
             recipe = craftingTable
-              ? bot.recipesFor(item.id, null, 1, craftingTable)[0]
-              : bot.recipesFor(item.id, null, 1, null)[0];
+              ? bot.recipesFor(item.id, null, desiredOutput, craftingTable)[0]
+              : bot.recipesFor(item.id, null, desiredOutput, null)[0];
           }
         }
       }
@@ -1065,8 +1326,10 @@ async function craftItem(bot: Bot, itemName: string, count: number): Promise<str
     );
   }
 
-  await bot.craft(recipe, count, craftingTable || undefined);
-  return `Crafted ${count}x ${resolvedName}.`;
+  const executions = craftExecutionsForOutput(desiredOutput, recipe.result.count);
+  await bot.craft(recipe, executions, craftingTable || undefined);
+  const produced = executions * recipe.result.count;
+  return `Crafted ${produced}x ${resolvedName}.`;
 }
 
 // Food ranked best→worst by hunger/saturation. The bot eats the best it has.

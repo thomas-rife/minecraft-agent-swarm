@@ -113,6 +113,13 @@ function recordMilestone(name: string, bot: string): void {
   dirty = true;
 }
 
+/** Only the build_farm completion message proves a wheat farm was created.
+ * Generic "planted" text also describes gather_wood replanting saplings. */
+export function isFarmCompletionResult(result: string): boolean {
+  const normalized = result.trim();
+  return /^Farm planted!\s+\d+\s+wheat seeds\b/i.test(normalized) || /^Farm complete\b/i.test(normalized);
+}
+
 /** Call after every executed action. */
 export function recordAction(botName: string, action: string, result: string, success: boolean): void {
   const b = botStats(botName);
@@ -127,7 +134,7 @@ export function recordAction(botName: string, action: string, result: string, su
     if (parseInt(depositMatch[1]) > 0) recordMilestone("first_stash_deposit", botName);
   }
   if (/HOUSE BUILT/.test(result)) recordMilestone("first_complete_house", botName);
-  if (/Farm complete|planted/i.test(result)) recordMilestone("first_farm", botName);
+  if (isFarmCompletionResult(result)) recordMilestone("first_farm", botName);
   if (/Stash bootstrapped/.test(result)) recordMilestone("first_stash", botName);
   dirty = true;
 }
@@ -147,7 +154,7 @@ export function recordDeath(botName: string): void {
 
 /** Record Ollama's native timing counters for model-speed comparisons. */
 export function recordLlmResponse(
-  kind: "strategic" | "reactive" | "legacy",
+  kind: "strategic" | "reactive" | "critic" | "legacy",
   model: string,
   response: {
     prompt_eval_count?: number;
@@ -172,8 +179,7 @@ export function recordLlmResponse(
   llm.wallDurationMs += wallDurationMs;
   // Ollama durations are nanoseconds.
   llm.evalDurationMs += (response.eval_duration ?? 0) / 1_000_000;
-  llm.generationTokensPerSec =
-    llm.evalDurationMs > 0 ? llm.outputTokens / (llm.evalDurationMs / 1000) : 0;
+  llm.generationTokensPerSec = llm.evalDurationMs > 0 ? llm.outputTokens / (llm.evalDurationMs / 1000) : 0;
   llm.averageWallMs = llm.wallDurationMs / llm.calls;
   dirty = true;
 }

@@ -2,13 +2,20 @@ import type { Bot } from "mineflayer";
 import type { Skill, SkillResult } from "./types.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
+import { safeGoto } from "../bot/navigation.js";
+import { getBotMemoryStore } from "../bot/memory-registry.js";
 const { goals, Movements } = pkg;
 
 export const lightAreaSkill: Skill = {
   name: "light_area",
   description:
     "Place torches in a grid pattern around the bot (every 5 blocks, 15-block radius). Uses torches from inventory.",
-  params: {},
+  params: {
+    x: { type: "number", description: "Optional center X" },
+    y: { type: "number", description: "Optional center Y" },
+    z: { type: "number", description: "Optional center Z" },
+    safetyZone: { type: "string", description: "Optional durable settlement safety-zone identifier" },
+  },
 
   estimateMaterials(_bot, _params) {
     // Uses whatever torches are in inventory, no gathering
@@ -16,6 +23,12 @@ export const lightAreaSkill: Skill = {
   },
 
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {
+    // Capture the work target before a stash visit moves the bot. Hierarchical
+    // shelter lighting supplies the recorded house center explicitly.
+    const requestedCenter =
+      Number.isFinite(params?.x) && Number.isFinite(params?.y) && Number.isFinite(params?.z)
+        ? new Vec3(Number(params.x), Number(params.y), Number(params.z))
+        : bot.entity.position.floored();
     const countTorches = () =>
       bot.inventory
         .items()
@@ -44,7 +57,18 @@ export const lightAreaSkill: Skill = {
     }
     const torchCount = countTorches();
 
-    const center = bot.entity.position.floored();
+    if (bot.entity.position.distanceTo(requestedCenter) > 6) {
+      try {
+        await safeGoto(bot, new goals.GoalNear(requestedCenter.x, requestedCenter.y, requestedCenter.z, 4), 35_000);
+      } catch {
+        return {
+          success: false,
+          message: `Got torches but could not return to the lighting target at (${requestedCenter.x}, ${requestedCenter.y}, ${requestedCenter.z}).`,
+        };
+      }
+    }
+
+    const center = requestedCenter.floored();
     const SPACING = 5;
     const RADIUS = 15;
     const positions: Vec3[] = [];
@@ -74,14 +98,13 @@ export const lightAreaSkill: Skill = {
     positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b));
 
     let placed = 0;
-    const total = Math.min(positions.length, torchCount);
+    let newlyPlaced = 0;
+    const total = Math.min(positions.length, Math.max(4, torchCount));
 
-    for (let i = 0; i < positions.length && placed < torchCount; i++) {
+    for (let i = 0; i < positions.length && placed < total; i++) {
       if (signal.aborted) break;
 
       const pos = positions[i];
-      const torch = bot.inventory.items().find((it) => it.name === "torch");
-      if (!torch) break;
 
       try {
         const dist = bot.entity.position.distanceTo(pos);
@@ -102,11 +125,15 @@ export const lightAreaSkill: Skill = {
           ]);
         }
 
-        await bot.equip(torch, "hand");
-
         // Place torch on the block below — re-check after navigation since world may have changed
         const below = bot.blockAt(pos.offset(0, -1, 0));
         const atPos = bot.blockAt(pos);
+        if (atPos?.name === "torch" || atPos?.name === "wall_torch") {
+          placed++;
+          continue;
+        }
+        const torch = bot.inventory.items().find((it) => it.name === "torch");
+        if (!torch) continue;
         // Skip if target spot is already occupied or ground is gone
         if (
           below &&
@@ -124,7 +151,10 @@ export const lightAreaSkill: Skill = {
               .catch(() => false),
             new Promise<boolean>((r) => setTimeout(() => r(false), 2000)),
           ]);
-          if (ok) placed++;
+          if (ok) {
+            placed++;
+            newlyPlaced++;
+          }
         }
       } catch {
         /* skip this position */
@@ -141,14 +171,27 @@ export const lightAreaSkill: Skill = {
       }
     }
 
-    if (placed === 0) {
-      return { success: false, message: "Couldn't place any torches. Terrain too rough." };
+    if (placed < 4) {
+      return {
+        success: false,
+        message: `Couldn't establish a safe lighting grid: only ${placed}/4 minimum positions were verified.`,
+        stats: { torchesPlaced: newlyPlaced, lightingPositionsVerified: placed },
+      };
+    }
+
+    const safetyZone = String(params?.safetyZone ?? "").trim();
+    if (safetyZone) {
+      getBotMemoryStore(bot)?.recordSafetyZone(
+        safetyZone,
+        { x: center.x, y: center.y, z: center.z },
+        placed,
+      );
     }
 
     return {
       success: true,
-      message: `Lit up the area! Placed ${placed} torches in a grid. Mobs hate this one weird trick.`,
-      stats: { torchesPlaced: placed },
+      message: `Lit up ${safetyZone || "the area"}! Verified ${placed} grid positions (${newlyPlaced} new torches).`,
+      stats: { torchesPlaced: newlyPlaced, lightingPositionsVerified: placed },
     };
   },
 };

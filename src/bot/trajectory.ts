@@ -26,6 +26,8 @@ export interface TrajectoryEntry {
   decision: { thought: string; action: string; params: Record<string, any>; goal?: string };
   /** Action result string */
   result: string;
+  /** False when the capability gate rejected a proposal before gameplay. */
+  executed?: boolean;
   success: boolean;
   timestamp: string;
 }

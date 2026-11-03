@@ -12,6 +12,7 @@ import {
 } from "./prompts.js";
 import { createLogger } from "../util/logger.js";
 import { recordLlmResponse } from "../bot/scoreboard.js";
+import type { ActionOption } from "../bot/action-menu.js";
 
 /** Model-aware think option. qwen3.6 needs think:false (it otherwise burns the
  *  whole token budget reasoning — the original gotcha). gpt-oss models are
@@ -122,10 +123,18 @@ const ACTION_ALIASES: Record<string, string> = {
   "generate skill": "generate_skill",
   generateskill: "generate_skill",
   "neural combat": "neural_combat",
+  kill_animal: "attack",
+  "kill animal": "attack",
+  hunt_animal: "attack",
+  "hunt animal": "attack",
+  hunt: "attack",
   "build house": "build_house",
   "build farm": "build_farm",
   "craft gear": "craft_gear",
   "strip mine": "strip_mine",
+  "choose objective": "choose_objective",
+  "choose subobjective": "choose_subobjective",
+  "leave objective": "leave_objective",
   craft_item: "craft",
   crafting: "craft",
 };
@@ -168,13 +177,25 @@ function parseDecision(
 
   // Normalize action name
   const rawAction = (typeof parsed.action === "string" ? parsed.action : "idle").toLowerCase().trim();
-  let action = ACTION_ALIASES[rawAction] ?? (typeof parsed.action === "string" ? parsed.action : "idle");
+  let action = ACTION_ALIASES[rawAction] ?? rawAction;
 
   // Normalize params
   const params = parsed.params ?? parsed.parameters ?? {};
 
   // Hoist top-level fields into params
-  for (const field of ["direction", "item", "block", "blockType", "count", "skill", "task", "message"]) {
+  for (const field of [
+    "direction",
+    "item",
+    "block",
+    "blockType",
+    "count",
+    "skill",
+    "task",
+    "message",
+    "objective",
+    "subobjective",
+    "reason",
+  ]) {
     if (parsed[field] !== undefined && params[field] === undefined) {
       params[field] = parsed[field];
     }
@@ -239,6 +260,53 @@ export async function queryStrategic(
   role: RoleContext,
 ): Promise<{ thought: string; action: string; params: Record<string, any>; goal?: string; goalSteps?: number }> {
   const memorySection = memoryContext ? `\nYOUR MEMORY:\n${memoryContext}\n` : "";
+  const hierarchySelection = role.actionOptions?.some(
+    (option) =>
+      option.action === "choose_objective" ||
+      option.action === "choose_subobjective" ||
+      option.action === "leave_objective",
+  );
+  const hierarchyOptions = (role.actionOptions ?? []).filter(
+    (option) =>
+      option.action === "choose_objective" ||
+      option.action === "choose_subobjective" ||
+      option.action === "leave_objective",
+  );
+  const hierarchyFormat = hierarchySelection
+    ? {
+        type: "object",
+        oneOf: hierarchyOptions.map((option) => {
+          const parameter =
+            option.action === "choose_objective"
+              ? "objective"
+              : option.action === "choose_subobjective"
+                ? "subobjective"
+                : "reason";
+          const parameterSchema =
+            parameter === "reason"
+              ? { type: "string", minLength: 1 }
+              : {
+                  type: "string",
+                  enum: option.allowedParams?.[parameter] ?? [],
+                };
+          return {
+            type: "object",
+            properties: {
+              thought: { type: "string" },
+              action: { const: option.action },
+              params: {
+                type: "object",
+                properties: { [parameter]: parameterSchema },
+                required: [parameter],
+                additionalProperties: false,
+              },
+            },
+            required: ["thought", "action", "params"],
+            additionalProperties: false,
+          };
+        }),
+      }
+    : "json";
   const messages: LLMMessage[] = [
     { role: "system", content: buildStrategicPrompt(role) },
     ...recentMessages.slice(-4), // Fewer history items — just enough for continuity
@@ -251,13 +319,13 @@ export async function queryStrategic(
       model: config.ollama.model, // Strong model for strategic decisions
       messages,
       think: thinkFor(config.ollama.model),
-      format: "json", // syntactically valid JSON guaranteed (schema mode is ignored by qwen3.6 on ollama 0.20)
+      format: hierarchyFormat,
       options: {
-        ...samplingFor(config.ollama.model, 0.8),
+        ...samplingFor(config.ollama.model, hierarchySelection ? 0.15 : 0.8),
         num_ctx: config.ollama.contextLength,
         // Strategic decisions are compact JSON. Keep enough room for gpt-oss
         // reasoning while preventing one request from monopolizing the queue.
-        num_predict: 512,
+        num_predict: hierarchySelection ? 192 : 512,
       },
     });
     recordLlmResponse("strategic", config.ollama.model, response, Date.now() - startedAt);
@@ -283,10 +351,10 @@ export async function queryStrategic(
 export async function queryReactive(
   name: string,
   situation: string,
-  allowedActions?: string[],
+  actionOptions?: ActionOption[],
 ): Promise<{ thought: string; action: string; params: Record<string, any> }> {
   const messages: LLMMessage[] = [
-    { role: "system", content: buildReactivePrompt(name, allowedActions) },
+    { role: "system", content: buildReactivePrompt(name, actionOptions) },
     { role: "user", content: situation },
   ];
 
@@ -325,7 +393,7 @@ export async function queryReactive(
 export async function queryCritic(
   name: string,
   actionContext: string,
-  allowedActions?: string[],
+  actionOptions?: ActionOption[],
 ): Promise<{
   success: boolean;
   thought: string;
@@ -334,11 +402,12 @@ export async function queryCritic(
   goalComplete: boolean;
 }> {
   const messages: LLMMessage[] = [
-    { role: "system", content: buildCriticPrompt(name, allowedActions) },
+    { role: "system", content: buildCriticPrompt(name, actionOptions) },
     { role: "user", content: actionContext },
   ];
 
   try {
+    const startedAt = Date.now();
     const response = await ollama.chat({
       model: config.ollama.fastModel,
       messages,
@@ -350,6 +419,7 @@ export async function queryCritic(
         num_predict: 384,
       },
     });
+    recordLlmResponse("critic", config.ollama.fastModel, response, Date.now() - startedAt);
 
     llmLog.info("LLM:critic", `(${response.message.content.length} chars): ${response.message.content.slice(0, 150)}`);
     llmLog.debug("LLM:critic", "Action context:", actionContext);

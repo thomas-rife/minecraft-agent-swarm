@@ -79,6 +79,8 @@ export function snapshotChest(
 
 export interface StashSummary {
   categories: Record<string, number>;
+  /** Exact last-observed item totals, used by the objective planner. */
+  items: Record<string, number>;
   freeSlots: number;
   totalSlots: number;
   chestCount: number;
@@ -112,6 +114,7 @@ export function getStashSummary(): StashSummary {
 
   return {
     categories,
+    items: Object.fromEntries(itemTotals),
     freeSlots: totalSlots - usedSlots,
     totalSlots,
     chestCount: chests.size,

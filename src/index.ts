@@ -3,8 +3,9 @@ import { createTwitchChat } from "./stream/twitch.js";
 import { startOverlay, addChatMessage } from "./stream/overlay.js";
 import { config } from "./config.js";
 import { loadDynamicSkills } from "./skills/dynamic-loader.js";
-import { BOT_ROSTER, BotRoleConfig } from "./bot/role.js";
+import { BOT_ROSTER, SOLO_CONFIG, BotRoleConfig } from "./bot/role.js";
 import { startUnifiedViewer } from "./stream/unified-viewer.js";
+import { startMemoryMonitor } from "./diagnostics/memory-monitor.js";
 
 loadDynamicSkills();
 
@@ -71,9 +72,9 @@ async function startBot(
     roleConfig,
   );
 
-  // Set up Twitch chat (Atlas only — Flora doesn't need her own chat connection)
+  // The active single player owns the optional Twitch connection.
   const twitch =
-    roleConfig.name === "Atlas"
+    roleConfig.name === "Atlas" || roleConfig.name === "Solo"
       ? createTwitchChat((msg) => {
           queueChat(msg);
           addChatMessage(msg.username, msg.message, (msg as any).tier ?? "free");
@@ -149,16 +150,27 @@ async function runBotLoop(roleConfig: BotRoleConfig): Promise<void> {
 }
 
 async function main() {
+  startMemoryMonitor();
   // Start the unified viewer server before any bots — it needs to be ready
   // to accept registerBot() calls when bots spawn. This serves the viewer
   // HTML, static assets, and handles socket.io relay for bot switching.
-  await startUnifiedViewer().catch((err) => {
-    console.warn("[Main] Unified viewer failed to start:", err);
-  });
+  if (config.viewer.enabled) {
+    await startUnifiedViewer().catch((err) => {
+      console.warn("[Main] Unified viewer failed to start:", err);
+    });
+  } else {
+    console.log("[Main] Unified viewer disabled for this run.");
+  }
 
   if (!config.multiBot.enabled) {
-    // Single bot mode — just Atlas
-    await runBotLoop(BOT_ROSTER[0]);
+    console.log(`[Main] Solo mode: launching ${SOLO_CONFIG.name} (${SOLO_CONFIG.role})...`);
+    try {
+      const { startDashboard } = await import("./stream/dashboard.js");
+      startDashboard([SOLO_CONFIG]);
+    } catch {
+      console.log("[Main] Dashboard module not available — skipping.");
+    }
+    await runBotLoop(SOLO_CONFIG);
     return;
   }
 

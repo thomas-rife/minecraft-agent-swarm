@@ -1,17 +1,26 @@
 import type { Bot } from "mineflayer";
-import type { Skill, SkillProgress, SkillResult } from "./types.js";
-import { houseBlueprint } from "./blueprints/house.js";
+import type { Blueprint, BlueprintBlock, Skill, SkillProgress, SkillResult } from "./types.js";
+import {
+  createShelterDesign,
+  decodeShelterDesign,
+  encodeShelterDesign,
+  shelterBlueprint,
+  type ShelterDesign,
+} from "./shelter-design.js";
 import { LOG_TYPES, PLANK_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
-import { hasStructureNearby, addStructure, getNearestStructure } from "../bot/memory.js";
+import { addStructure } from "../bot/memory.js";
 import { getBotMemoryStore, getAllMemoryStores } from "../bot/memory-registry.js";
-import { collectNearbyDrops } from "../bot/navigation.js";
+import { collectNearbyDrops, safeGoto } from "../bot/navigation.js";
+import { HOUSE_WOOD_TARGET } from "../bot/goal-requirements.js";
+import { SETTLEMENT_STRUCTURE_RADIUS } from "../bot/role.js";
+import { footprintAtCenter, preferredHouseCenter } from "./settlement-layout.js";
 
 /** All door types — any wood's door works interchangeably */
-const DOOR_TYPES = [
+export const DOOR_TYPES = [
   "oak_door",
   "spruce_door",
   "birch_door",
@@ -22,13 +31,16 @@ const DOOR_TYPES = [
   "mangrove_door",
 ] as const;
 
-/** Remember last build site so repeated build_house calls finish the same house */
-let lastBuildSite: Vec3 | null = null;
+const BUILD_BUDGET_MS = 120_000;
+const MAX_BLOCKS_PER_PASS = 32;
+const REPLACEABLE = new Set(["air", "short_grass", "tall_grass", "snow"]);
+const TERRAIN_CLEARABLE = new Set(["short_grass", "tall_grass", "snow", "vine"]);
+const MAX_TERRAIN_CHANGES = 48;
 
 export const buildHouseSkill: Skill = {
   name: "build_house",
   description:
-    "Build a 7x7 house with walls, roof, door, crafting table, and torches. Works with ANY wood type. Gathers materials automatically. Takes ~2 minutes.",
+    "Ask the local model to design a compact shelter, then build or resume it on a supported floor that adapts to uneven terrain.",
   params: {},
 
   estimateMaterials(_bot, _params) {
@@ -39,71 +51,124 @@ export const buildHouseSkill: Skill = {
   },
 
   async execute(bot, params, signal, onProgress): Promise<SkillResult> {
-    const bp = houseBlueprint;
+    const startedAt = Date.now();
+    const settlementAnchor = (
+      params as {
+        settlementAnchor?: { x: number; y: number; z: number };
+        stashPos?: { x: number; y: number; z: number };
+      }
+    )?.settlementAnchor ?? params?.stashPos;
+    if (!settlementAnchor) {
+      return {
+        success: false,
+        message: "No settlement anchor configured for build_house.",
+      };
+    }
 
-    // --- Step 1: Find a flat build site ---
+    // --- Step 1: choose a design and establish a supported site ---
     onProgress({
       skillName: "build_house",
       phase: "Finding build site",
       progress: 0,
-      message: "Scanning for flat ground...",
+      message: "Choosing a shelter design and surveying its footprint...",
       active: true,
     });
 
-    // Site selection — TEAM-aware. Check every bot's memory, not just our own:
-    // per-bot structure memory made each bot start its own overlapping shell
-    // one block apart because it couldn't see what teammates had built.
-    let origin: Vec3 | null = null;
-    if (lastBuildSite && bot.entity.position.distanceTo(lastBuildSite) < 50) {
-      origin = lastBuildSite;
-      console.log(`[Skill] Reusing previous build site at ${origin.x}, ${origin.y}, ${origin.z}`);
-    } else {
-      const botPos = bot.entity.position;
-      const candidates = getAllMemoryStores()
-        .map((s) => s.getNearestStructure("house", botPos.x, botPos.z))
-        .filter((st): st is NonNullable<typeof st> => !!st)
-        .filter((st) => Math.hypot(st.x - botPos.x, st.z - botPos.z) < 12)
-        .sort((a, b) => Math.hypot(a.x - botPos.x, a.z - botPos.z) - Math.hypot(b.x - botPos.x, b.z - botPos.z));
-      const nearest =
-        candidates[0] ??
-        (hasStructureNearby("house", botPos.x, botPos.y, botPos.z, 12)
-          ? getNearestStructure("house", botPos.x, botPos.z)
-          : null);
+    // Site selection is TEAM-aware and anchored to the configured settlement.
+    // A house built near a distant tree or in an old world is intentionally not
+    // allowed to complete the current settlement objective.
+    const houses = getAllMemoryStores()
+      .flatMap((store) => [...store.getStructures()])
+      .filter((structure) => structure.type === "house")
+      .filter(
+        (structure) =>
+          Math.hypot(structure.x - settlementAnchor.x, structure.z - settlementAnchor.z) <=
+          SETTLEMENT_STRUCTURE_RADIUS,
+      )
+      .sort(
+        (a, b) =>
+          Math.hypot(a.x - settlementAnchor.x, a.z - settlementAnchor.z) -
+          Math.hypot(b.x - settlementAnchor.x, b.z - settlementAnchor.z),
+      );
+    const completed = houses.find((house) => !(house.notes ?? "").includes("(partial)"));
+    if (completed) {
+      return {
+        success: true,
+        message: `House already built at (${completed.x}, ${completed.y}, ${completed.z}). Use go_to ${completed.x} ${completed.y} ${completed.z} to visit the shared home.`,
+      };
+    }
 
-      if (nearest && !(nearest.notes ?? "").includes("partial")) {
+    const partial = houses.find((house) => (house.notes ?? "").includes("(partial)"));
+    const design = decodeShelterDesign(partial?.notes) ?? (await createShelterDesign());
+    const bp = shelterBlueprint(design);
+    let origin: Vec3 | null = partial ? new Vec3(partial.x, partial.y, partial.z) : null;
+    if (origin) {
+      console.log(`[Skill] Resuming shared house at ${origin.x}, ${origin.y}, ${origin.z}`);
+      await safeGoto(bot, new goals.GoalNear(origin.x, origin.y, origin.z, 4), 35_000).catch(() => {});
+    } else {
+      const preferred = footprintAtCenter(preferredHouseCenter(settlementAnchor), bp);
+      const approach = new Vec3(
+        preferred.x + Math.floor(preferred.width / 2),
+        settlementAnchor.y,
+        preferred.z + preferred.depth,
+      );
+      try {
+        await safeGoto(bot, new goals.GoalNear(approach.x, approach.y, approach.z, 5), 35_000);
+        await bot.waitForChunksToLoad();
+      } catch {
         return {
-          success: true, // Treat as success so it doesn't get blacklisted — house already built!
-          message: `House already built at (${nearest.x}, ${nearest.y}, ${nearest.z}). Use go_to ${nearest.x} ${nearest.y} ${nearest.z} to visit the existing home.`,
+          success: false,
+          message: `Could not reach the shared house zone near (${approach.x}, ${approach.y}, ${approach.z}).`,
         };
       }
-      if (nearest) {
-        // Partial house — RESUME it. The placement loop counts already-placed
-        // blocks as done, so re-running at the same origin fills the gaps.
-        origin = new Vec3(nearest.x, nearest.y, nearest.z);
-        console.log(`[Skill] Resuming partial house at ${origin.x}, ${origin.y}, ${origin.z}`);
-      } else {
-        origin = findBuildSite(bot, 7, 7);
-      }
+      origin = findAnchoredBuildSite(bot, settlementAnchor, bp);
     }
     if (!origin) {
       return {
         success: false,
-        message: "Can't find flat ground for a 7x7 house nearby. Try exploring to find open terrain!",
+        message: "Could not load terrain beneath the compact shelter footprint near the settlement anchor.",
       };
     }
-    lastBuildSite = origin;
+
+    // Reserve the site before gathering or placing anything. Every bot can
+    // now resume this exact origin instead of starting another shell.
+    rememberHouse(bot, origin, houseNotes(bp.name, design, true));
 
     console.log(`[Skill] Build site at ${origin.x}, ${origin.y}, ${origin.z}`);
+
+    // Clear a bounded amount of vegetation before construction. The reserved
+    // origin makes this resumable: if a pass is interrupted, the next pass
+    // prepares the same footprint rather than searching for a different site.
+    const preparation = await prepareHouseSite(bot, origin, bp, signal, onProgress);
+    if (!preparation.success) return preparation;
 
     // --- Step 2: Gather wood (any type) ---
     const totalPlanksNeeded = Object.entries(bp.materials)
       .filter(([name]) => name.endsWith("_planks"))
       .reduce((sum, [, count]) => sum + count, 0);
 
+    const existingPlankBlocks = bp.blocks
+      .filter((block) => block.block.endsWith("_planks"))
+      .filter((block) => blockMatchesBlueprint(bot, origin, block)).length;
+    const remainingPlanksNeeded = Math.max(0, totalPlanksNeeded - existingPlankBlocks);
+
     // +8 margin for crafting table (4 planks) and sticks (2 planks) and waste
     // +6 for door crafting (6 planks → 3 doors, we need 2)
     const doorsNeeded = bp.materials["oak_door"] || 0;
-    const totalPlanksTarget = totalPlanksNeeded + 8 + (doorsNeeded > 0 ? 6 : 0);
+    const doorAlreadyPlaced = bp.blocks
+      .filter((block) => block.block.endsWith("_door"))
+      .some((block) => blockMatchesBlueprint(bot, origin, block));
+    const tableAlreadyPlaced = bp.blocks
+      .filter((block) => block.block === "crafting_table")
+      .some((block) => blockMatchesBlueprint(bot, origin, block));
+    const setupMargin = tableAlreadyPlaced ? 4 : 8;
+    const calculatedPlanksTarget =
+      remainingPlanksNeeded + setupMargin + (doorsNeeded > 0 && !doorAlreadyPlaced ? 6 : 0);
+    // The lodge remains resumable. Acquire one useful
+    // construction batch at a time; persistent partial-site memory makes the
+    // next objective pass continue instead of demanding the entire house in
+    // one inventory.
+    const totalPlanksTarget = Math.min(calculatedPlanksTarget, HOUSE_WOOD_TARGET);
 
     // Pull building materials from the shared stash before chopping trees. The
     // team gathers wood + cobblestone and deposits it, so the warehouse usually
@@ -199,14 +264,14 @@ export const buildHouseSkill: Skill = {
     // Craft ALL log types into their respective planks
     await craftAllLogsToPlanks(bot, signal);
 
-    // Material gate: starting a 174-block build with a handful of planks
-    // produces roofless 35-block shells. Precondition-style failure message
-    // (matches the brain's non-blacklisting patterns) so the bot gathers more.
+    // Require a useful batch, but never demand the entire lodge blueprint in
+    // one inventory. Later passes recalculate only what is still missing.
     const planksNow = countAllPlanks(bot);
-    if (planksNow < totalPlanksNeeded * 0.7) {
+    const minimumUsefulBatch = Math.min(remainingPlanksNeeded, Math.ceil(HOUSE_WOOD_TARGET / 2));
+    if (planksNow < minimumUsefulBatch) {
       return {
         success: false,
-        message: `Not enough planks to build a real house — need ~${totalPlanksTarget}, have ${planksNow}. Use gather_wood to get more logs first.`,
+        message: `Not enough planks for the next house section — need at least ${minimumUsefulBatch}, have ${planksNow}. Gather or withdraw more wood, then resume the same site.`,
       };
     }
 
@@ -236,7 +301,12 @@ export const buildHouseSkill: Skill = {
     }
 
     const planksReady = countAllPlanks(bot);
-    console.log(`[Skill] Crafting done. Have ${planksReady} planks, need ~${totalPlanksNeeded}`);
+    console.log(
+      `[Skill] Crafting done. Have ${planksReady} planks for this pass; ${remainingPlanksNeeded}/${totalPlanksNeeded} blueprint planks remain`,
+    );
+
+    const foundation = await buildFoundationSupports(bot, origin, bp, signal, onProgress);
+    if (!foundation.success) return foundation;
 
     // --- Step 4: Place blocks from blueprint ---
     const structureBlocks = bp.blocks.filter((b) => b.phase === "structure").sort((a, b) => a.pos[1] - b.pos[1]); // bottom-up
@@ -245,29 +315,24 @@ export const buildHouseSkill: Skill = {
     const allBlocks = [...structureBlocks, ...interiorBlocks];
     const total = allBlocks.length;
     let placed = 0;
+    let newlyPlaced = 0;
     let skipped = 0;
 
     for (let i = 0; i < allBlocks.length; i++) {
-      if (signal.aborted) {
-        return {
-          success: false,
-          message: `House building interrupted! Placed ${placed}/${total} blocks. It's... abstract art now.`,
-        };
-      }
+      if (signal.aborted || Date.now() - startedAt >= BUILD_BUDGET_MS || newlyPlaced >= MAX_BLOCKS_PER_PASS) break;
 
       const bpBlock = allBlocks[i];
       const worldPos = new Vec3(origin.x + bpBlock.pos[0], origin.y + bpBlock.pos[1], origin.z + bpBlock.pos[2]);
 
-      // Skip if already occupied
+      // Count only the intended block (with any wood variant), never arbitrary
+      // terrain or an overlapping structure.
       const existing = bot.blockAt(worldPos);
-      if (
-        existing &&
-        existing.name !== "air" &&
-        existing.name !== "water" &&
-        existing.name !== "short_grass" &&
-        existing.name !== "tall_grass"
-      ) {
+      if (existing && blockNameMatches(existing.name, bpBlock.block)) {
         placed++;
+        continue;
+      }
+      if (existing && !REPLACEABLE.has(existing.name)) {
+        skipped++;
         continue;
       }
 
@@ -305,8 +370,10 @@ export const buildHouseSkill: Skill = {
                 .catch(() => false),
               new Promise<boolean>((r) => setTimeout(() => r(false), 2000)),
             ]);
-            if (ok) placed++;
-            else skipped++;
+            if (ok) {
+              placed++;
+              newlyPlaced++;
+            } else skipped++;
           } else {
             skipped++;
           }
@@ -323,8 +390,10 @@ export const buildHouseSkill: Skill = {
                 .catch(() => false),
               new Promise<boolean>((r) => setTimeout(() => r(false), 2000)),
             ]);
-            if (ok) placed++;
-            else skipped++;
+            if (ok) {
+              placed++;
+              newlyPlaced++;
+            } else skipped++;
           } else {
             skipped++;
           }
@@ -358,25 +427,24 @@ export const buildHouseSkill: Skill = {
       /* ok */
     }
 
-    if (placed > total * 0.7) {
-      // Save house to per-bot memory (falls back to singleton if no per-bot store registered)
-      const _ms = getBotMemoryStore(bot);
-      if (_ms) _ms.addStructure("house", origin.x, origin.y, origin.z, bp.name);
-      else addStructure("house", origin.x, origin.y, origin.z, bp.name);
+    const remaining = bp.blocks.filter((block) => !blockMatchesBlueprint(bot, origin, block));
+    // Torches are best-effort decoration. The floor, shell, doors, and table
+    // must really exist before the shared objective reports a complete house.
+    const complete = remaining.every((block) => block.block === "torch");
+
+    if (complete) {
+      rememberHouse(bot, origin, houseNotes(bp.name, design, false));
       return {
         success: true,
-        message: `HOUSE BUILT! "${bp.name}" at ${origin.x}, ${origin.y}, ${origin.z}. Placed ${placed} blocks (${skipped} skipped). It's GORGEOUS. It's HOME.`,
-        stats: { blocksPlaced: placed, blocksSkipped: skipped },
+        message: `HOUSE BUILT! "${bp.name}" at ${origin.x}, ${origin.y}, ${origin.z}. Placed ${newlyPlaced} blocks this pass (${remaining.length} optional lights remain). It's GORGEOUS. It's HOME.`,
+        stats: { blocksPlaced: newlyPlaced, blocksSkipped: skipped, blocksRemaining: remaining.length },
       };
-    } else if (placed > 0) {
-      // Save house to per-bot memory (even if partial)
-      const _ms = getBotMemoryStore(bot);
-      if (_ms) _ms.addStructure("house", origin.x, origin.y, origin.z, `${bp.name} (partial)`);
-      else addStructure("house", origin.x, origin.y, origin.z, `${bp.name} (partial)`);
+    } else if (newlyPlaced > 0 || placed > 0) {
+      rememberHouse(bot, origin, houseNotes(bp.name, design, true));
       return {
         success: true,
-        message: `House partially built (${placed}/${total} blocks). It has... character. Maybe patch the holes later.`,
-        stats: { blocksPlaced: placed, blocksSkipped: skipped },
+        message: `House partially built (${total - remaining.length}/${total} blocks) at (${origin.x}, ${origin.y}, ${origin.z}): placed ${newlyPlaced} this pass; ${remaining.length} remain. Resume build_house at the shared site.`,
+        stats: { blocksPlaced: newlyPlaced, blocksSkipped: skipped, blocksRemaining: remaining.length },
       };
     }
     return {
@@ -389,7 +457,7 @@ export const buildHouseSkill: Skill = {
 // --- Helpers ---
 
 /** Drop junk items to make room for building materials. Keep best tools, food, and building items. */
-async function clearInventoryJunk(bot: Bot) {
+export async function clearInventoryJunk(bot: Bot) {
   const items = bot.inventory.items();
   const usedSlots = items.length;
   if (usedSlots < 30) return; // Plenty of room
@@ -460,7 +528,7 @@ async function clearInventoryJunk(bot: Bot) {
   console.log(`[Skill] Inventory after cleanup: ${bot.inventory.items().length}/36 slots`);
 }
 
-function setMovements(bot: Bot) {
+export function setMovements(bot: Bot) {
   const moves = new Movements(bot);
   moves.canDig = false;
   moves.allow1by1towers = false;
@@ -469,36 +537,226 @@ function setMovements(bot: Bot) {
   bot.pathfinder.setMovements(moves);
 }
 
-/** Find a reasonably flat rectangular area near the bot. Returns origin (ground level). */
-function findBuildSite(bot: Bot, width: number, depth: number): Vec3 | null {
-  const pos = bot.entity.position.floored();
+/**
+ * Find a surface site near the house's assigned settlement zone. The bot's
+ * current position never influences the target, so gathering cannot drag the
+ * shared base toward a forest or cave.
+ */
+function findAnchoredBuildSite(
+  bot: Bot,
+  anchor: { x: number; y: number; z: number },
+  blueprint: Blueprint,
+): Vec3 | null {
+  const preferred = footprintAtCenter(preferredHouseCenter(anchor), blueprint);
+  const offsets: { x: number; z: number }[] = [{ x: 0, z: 0 }];
+  for (let radius = 2; radius <= 24; radius += 2) {
+    for (let dx = -radius; dx <= radius; dx += 2) {
+      for (let dz = -radius; dz <= radius; dz += 2) {
+        if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) continue;
+        offsets.push({ x: dx, z: dz });
+      }
+    }
+  }
 
-  // Two passes: strict (1 block tolerance), then relaxed (2 block tolerance)
-  for (const tolerance of [1, 2]) {
-    for (let r = 3; r <= 30; r++) {
-      for (let dx = -r; dx <= r; dx += 2) {
-        for (let dz = -r; dz <= r; dz += 2) {
-          if (Math.abs(dx) < r - 1 && Math.abs(dz) < r - 1) continue;
+  for (const offset of offsets) {
+    const x = preferred.x + offset.x;
+    const z = preferred.z + offset.z;
+    const centerX = x + Math.floor(blueprint.dimensions[0] / 2);
+    const centerZ = z + Math.floor(blueprint.dimensions[2] / 2);
+    if (Math.hypot(centerX - anchor.x, centerZ - anchor.z) > 32) continue;
+    // Preserve a six-block shared yard between the south wall/entrance and
+    // the stash row at the anchor.
+    if (z + blueprint.dimensions[2] > anchor.z - 6) continue;
 
-          const baseY = groundLevel(bot, pos.x + dx, pos.z + dz);
-          if (baseY === null) continue;
+    const heights: number[] = [];
+    let usable = true;
+    for (let fx = 0; fx < blueprint.dimensions[0] && usable; fx++) {
+      for (let fz = 0; fz < blueprint.dimensions[2]; fz++) {
+        const ground = groundLevel(bot, x + fx, z + fz);
+        if (ground === null) {
+          usable = false;
+          break;
+        }
+        heights.push(ground);
+      }
+    }
+    if (!usable || heights.length === 0) continue;
 
-          let flat = true;
-          for (let fx = 0; fx < width && flat; fx += 3) {
-            for (let fz = 0; fz < depth && flat; fz += 3) {
-              const gy = groundLevel(bot, pos.x + dx + fx, pos.z + dz + fz);
-              if (gy === null || Math.abs(gy - baseY) > tolerance) flat = false;
-            }
+    const floorY = Math.max(...heights) + 1;
+    let terrainChanges = 0;
+    for (let fx = 0; fx < blueprint.dimensions[0] && usable; fx++) {
+      for (let fz = 0; fz < blueprint.dimensions[2] && usable; fz++) {
+        for (let fy = 0; fy < blueprint.dimensions[1]; fy++) {
+          const block = bot.blockAt(new Vec3(x + fx, floorY + fy, z + fz));
+          if (!block) {
+            usable = false;
+            break;
           }
-          if (flat) return new Vec3(pos.x + dx, baseY, pos.z + dz);
+          if (REPLACEABLE.has(block.name)) continue;
+          const naturalVegetation =
+            TERRAIN_CLEARABLE.has(block.name) ||
+            block.name.includes("leaves") ||
+            block.name.endsWith("_log") ||
+            block.name.endsWith("_stem");
+          if (!naturalVegetation) {
+            usable = false;
+            break;
+          }
+          terrainChanges++;
+          if (terrainChanges > MAX_TERRAIN_CHANGES) {
+            usable = false;
+            break;
+          }
         }
       }
     }
+    if (usable) return new Vec3(x, floorY, z);
   }
   return null;
 }
 
-function groundLevel(bot: Bot, x: number, z: number): number | null {
+async function prepareHouseSite(
+  bot: Bot,
+  origin: Vec3,
+  blueprint: Blueprint,
+  signal: AbortSignal,
+  onProgress: (progress: SkillProgress) => void,
+): Promise<SkillResult> {
+  const obstructions: Vec3[] = [];
+  for (let x = 0; x < blueprint.dimensions[0]; x++) {
+    for (let z = 0; z < blueprint.dimensions[2]; z++) {
+      for (let y = 0; y < blueprint.dimensions[1]; y++) {
+        const position = origin.offset(x, y, z);
+        const block = bot.blockAt(position);
+        if (!block || REPLACEABLE.has(block.name)) continue;
+        const clearable =
+          TERRAIN_CLEARABLE.has(block.name) ||
+          block.name.includes("leaves") ||
+          block.name.endsWith("_log") ||
+          block.name.endsWith("_stem");
+        if (!clearable) continue;
+        obstructions.push(position);
+      }
+    }
+  }
+  if (obstructions.length > MAX_TERRAIN_CHANGES) {
+    return {
+      success: false,
+      message: `House site needs ${obstructions.length} terrain changes; bounded preparation permits ${MAX_TERRAIN_CHANGES}.`,
+    };
+  }
+  if (obstructions.length === 0) return { success: true, message: "House footprint is prepared." };
+
+  let cleared = 0;
+  for (const position of obstructions) {
+    if (signal.aborted) return { success: false, message: "Interrupted while preparing the house site." };
+    const block = bot.blockAt(position);
+    if (!block || REPLACEABLE.has(block.name)) continue;
+    try {
+      if (bot.entity.position.distanceTo(position) > 4.5) {
+        await safeGoto(bot, new goals.GoalNear(position.x, position.y, position.z, 3), 10_000);
+      }
+      await Promise.race([
+        bot.dig(block, true),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("terrain dig timeout")), 5_000)),
+      ]);
+      cleared++;
+    } catch {
+      return {
+        success: false,
+        message: `Terrain preparation stopped after ${cleared}/${obstructions.length} changes at (${position.x}, ${position.y}, ${position.z}); resume the same house site.`,
+        stats: { terrainCleared: cleared, terrainRemaining: obstructions.length - cleared },
+      };
+    }
+    if (cleared % 4 === 0) {
+      onProgress({
+        skillName: "build_house",
+        phase: "Preparing lodge site",
+        progress: Math.min(0.08, (cleared / obstructions.length) * 0.08),
+        message: `Cleared ${cleared}/${obstructions.length} bounded terrain obstructions`,
+        active: true,
+      });
+    }
+  }
+  return {
+    success: true,
+    message: `Prepared the reserved lodge footprint with ${cleared} terrain changes.`,
+    stats: { terrainCleared: cleared },
+  };
+}
+
+function blockNameMatches(actual: string, expected: string): boolean {
+  if (expected.endsWith("_planks")) return (PLANK_TYPES as readonly string[]).includes(actual);
+  if (expected.endsWith("_door")) return (DOOR_TYPES as readonly string[]).includes(actual);
+  return actual === expected;
+}
+
+export function blockMatchesBlueprint(bot: Bot, origin: Vec3, block: BlueprintBlock): boolean {
+  const existing = bot.blockAt(
+    new Vec3(origin.x + block.pos[0], origin.y + block.pos[1], origin.z + block.pos[2]),
+  );
+  return !!existing && blockNameMatches(existing.name, block.block);
+}
+
+function rememberHouse(bot: Bot, origin: Vec3, notes: string): void {
+  const store = getBotMemoryStore(bot);
+  if (store) store.addStructure("house", origin.x, origin.y, origin.z, notes);
+  else addStructure("house", origin.x, origin.y, origin.z, notes);
+}
+
+function houseNotes(name: string, design: ShelterDesign, partial: boolean): string {
+  return `${name}${partial ? " (partial)" : ""} [shelter-design:${encodeShelterDesign(design)}]`;
+}
+
+/** Build columns from the terrain up to the raised floor. This lets the bot
+ * establish a placement face even when the footprint crosses a slope. */
+async function buildFoundationSupports(
+  bot: Bot,
+  origin: Vec3,
+  blueprint: Blueprint,
+  signal: AbortSignal,
+  onProgress: (progress: SkillProgress) => void,
+): Promise<SkillResult> {
+  const columns: Array<{ x: number; z: number; ground: number }> = [];
+  const supportCells = [
+    [0, 0],
+    [blueprint.dimensions[0] - 1, 0],
+    [0, blueprint.dimensions[2] - 1],
+    [blueprint.dimensions[0] - 1, blueprint.dimensions[2] - 1],
+  ] as const;
+  for (const [x, z] of supportCells) {
+      const ground = groundLevel(bot, origin.x + x, origin.z + z);
+      if (ground === null) return { success: false, message: "Foundation terrain is not loaded; resume near the reserved shelter." };
+      if (ground < origin.y - 1) columns.push({ x, z, ground });
+  }
+  let placed = 0;
+  for (const column of columns) {
+    for (let y = column.ground + 1; y < origin.y; y++) {
+      if (signal.aborted) return { success: false, message: "Interrupted while building shelter supports." };
+      const target = new Vec3(origin.x + column.x, y, origin.z + column.z);
+      const existing = bot.blockAt(target);
+      if (existing && !REPLACEABLE.has(existing.name)) continue;
+      const item = bot.inventory.items().find((entry) => (PLANK_TYPES as readonly string[]).includes(entry.name));
+      if (!item) return { success: false, message: `Shelter foundation needs more planks after placing ${placed} supports.` };
+      try {
+        if (bot.entity.position.distanceTo(target) > 4.5)
+          await safeGoto(bot, new goals.GoalNear(target.x, target.y, target.z, 3), 10_000);
+        const ref = findPlacementRef(bot, target);
+        if (!ref) return { success: false, message: `No placement face for support at (${target.x}, ${target.y}, ${target.z}).` };
+        await bot.equip(item, "hand");
+        await bot.placeBlock(ref.block, ref.face);
+        placed++;
+      } catch {
+        return { success: false, message: `Could not place shelter support at (${target.x}, ${target.y}, ${target.z}); resume the reserved site.` };
+      }
+    }
+  }
+  if (placed > 0)
+    onProgress({ skillName: "build_house", phase: "Building foundation", progress: 0.18, message: `Placed ${placed} terrain supports`, active: true });
+  return { success: true, message: `Foundation ready with ${placed} new supports.`, stats: { supportsPlaced: placed } };
+}
+
+export function groundLevel(bot: Bot, x: number, z: number): number | null {
   const botY = Math.floor(bot.entity.position.y);
   for (let y = botY + 5; y >= botY - 10; y--) {
     const block = bot.blockAt(new Vec3(x, y, z));
@@ -520,7 +778,7 @@ function groundLevel(bot: Bot, x: number, z: number): number | null {
 }
 
 /** Find a solid block adjacent to targetPos that we can place against. */
-function findPlacementRef(bot: Bot, targetPos: Vec3): { block: any; face: Vec3 } | null {
+export function findPlacementRef(bot: Bot, targetPos: Vec3): { block: any; face: Vec3 } | null {
   const faces = [
     new Vec3(0, -1, 0),
     new Vec3(0, 1, 0),
@@ -540,7 +798,7 @@ function findPlacementRef(bot: Bot, targetPos: Vec3): { block: any; face: Vec3 }
 }
 
 /** Craft each log type into its corresponding planks. */
-async function craftAllLogsToPlanks(bot: Bot, signal: AbortSignal): Promise<void> {
+export async function craftAllLogsToPlanks(bot: Bot, signal: AbortSignal): Promise<void> {
   const mcData = mcDataLoader(bot.version);
 
   // Also try placing a crafting table for recipes that need one
@@ -593,7 +851,7 @@ async function craftAllLogsToPlanks(bot: Bot, signal: AbortSignal): Promise<void
 }
 
 /** Place a crafting table from inventory if none nearby (needed for door recipe). */
-async function placeTableIfNeeded(bot: Bot): Promise<void> {
+export async function placeTableIfNeeded(bot: Bot): Promise<void> {
   const existing = bot.findBlock({ matching: (b) => b.name === "crafting_table", maxDistance: 32 });
   if (existing) return;
 
@@ -624,7 +882,7 @@ async function placeTableIfNeeded(bot: Bot): Promise<void> {
 }
 
 /** Craft doors from whatever planks are available (any wood type works). */
-async function craftDoors(bot: Bot, count: number, signal: AbortSignal): Promise<void> {
+export async function craftDoors(bot: Bot, count: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   const mcData = mcDataLoader(bot.version);
 
@@ -668,7 +926,7 @@ async function craftDoors(bot: Bot, count: number, signal: AbortSignal): Promise
 }
 
 /** Craft a specific count of an item (uses any valid recipe). */
-async function craftSome(bot: Bot, itemName: string, count: number, signal: AbortSignal): Promise<void> {
+export async function craftSome(bot: Bot, itemName: string, count: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   const mcData = mcDataLoader(bot.version);
   const mcItem = mcData.itemsByName[itemName];
@@ -681,11 +939,12 @@ async function craftSome(bot: Bot, itemName: string, count: number, signal: Abor
   if (have >= count) return;
 
   // Try hand crafting first (no table needed for planks, sticks)
+  let table: ReturnType<Bot["findBlock"]> | null = null;
   let recipe = bot.recipesFor(mcItem.id, null, 1, null)[0];
 
   // If no hand recipe, try with a crafting table
   if (!recipe) {
-    const table = bot.findBlock({
+    table = bot.findBlock({
       matching: (b) => b.name === "crafting_table",
       maxDistance: 32,
     });
@@ -703,7 +962,7 @@ async function craftSome(bot: Bot, itemName: string, count: number, signal: Abor
   if (!recipe) return;
   const needed = Math.ceil(count - have);
   try {
-    await bot.craft(recipe, needed, undefined);
+    await bot.craft(recipe, needed, table || undefined);
   } catch {
     /* ok */
   }

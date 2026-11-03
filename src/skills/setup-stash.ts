@@ -3,21 +3,23 @@
 
 import type { Bot } from "mineflayer";
 import type { Skill, SkillResult } from "./types.js";
-import { LOG_TYPES, PLANK_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
+import { LOG_TYPES, countAllLogs, countAllPlanks } from "./materials.js";
 import { Vec3 } from "vec3";
 import pkg from "mineflayer-pathfinder";
 const { goals, Movements } = pkg;
 import mcDataLoader from "minecraft-data";
 import { safeGoto } from "../bot/actions.js";
+import { snapshotChest } from "./stash-ledger.js";
 
 export const setupStashSkill: Skill = {
   name: "setup_stash",
   description:
-    "Bootstrap the shared stash: walk to the stash position, craft 2 chests if needed, and place them as a double chest. Requires logs or planks in inventory.",
+    "Bootstrap or deliberately expand the shared stash. mode=ensure creates the initial double chest; mode=expand adds verified new capacity instead of accepting an existing chest as success.",
   params: {
     x: { type: "number", description: "Stash X coordinate" },
     y: { type: "number", description: "Stash Y coordinate" },
     z: { type: "number", description: "Stash Z coordinate" },
+    mode: { type: "string", description: "ensure (default) or expand" },
   },
 
   estimateMaterials(_bot, _params) {
@@ -29,6 +31,8 @@ export const setupStashSkill: Skill = {
     const stashX = Number(params.x);
     const stashY = Number(params.y);
     const stashZ = Number(params.z);
+    const expanding = String(params.mode ?? "ensure").toLowerCase() === "expand";
+    const requiredChests = expanding ? 1 : 2;
 
     if (isNaN(stashX) || isNaN(stashY) || isNaN(stashZ)) {
       return { success: false, message: "Invalid stash position — x, y, z must be numbers." };
@@ -65,6 +69,7 @@ export const setupStashSkill: Skill = {
         block.name !== "air" &&
         block.name !== "cave_air" &&
         block.name !== "water" &&
+        !["chest", "trapped_chest", "crafting_table", "furnace"].includes(block.name) &&
         !block.name.includes("leaves") &&
         above &&
         (above.name === "air" || above.name === "short_grass" || above.name === "tall_grass")
@@ -83,12 +88,19 @@ export const setupStashSkill: Skill = {
       active: true,
     });
 
-    const existingChest = bot.findBlock({
+    const existingChestPositions = bot.findBlocks({
       matching: (b) => b.name === "chest" || b.name === "trapped_chest",
-      maxDistance: 8,
+      maxDistance: 10,
+      count: 32,
     });
+    const existingChest = existingChestPositions
+      .map((position) => bot.blockAt(position))
+      .find((block): block is NonNullable<typeof block> => !!block);
+    const beforeChestKeys = new Set(
+      existingChestPositions.map((position) => `${position.x},${position.y},${position.z}`),
+    );
 
-    if (existingChest) {
+    if (existingChest && !expanding) {
       // A stash exists — check whether it still has room. If it's full,
       // fall through and place an additional chest (stash expansion).
       let hasRoom = true;
@@ -122,9 +134,17 @@ export const setupStashSkill: Skill = {
         message: "Stash is full — placing an additional chest...",
         active: true,
       });
+    } else if (existingChest && expanding) {
+      onProgress({
+        skillName: "setup_stash",
+        phase: "Expanding stash",
+        progress: 0.2,
+        message: `Existing stash has ${beforeChestKeys.size} chest block(s); adding new capacity...`,
+        active: true,
+      });
     }
 
-    // --- Step 3: Ensure we have 2 chests ---
+    // --- Step 3: Ensure we have the required chest items ---
     onProgress({
       skillName: "setup_stash",
       phase: "Preparing chests",
@@ -138,10 +158,10 @@ export const setupStashSkill: Skill = {
       .filter((i) => i.name === "chest")
       .reduce((sum, i) => sum + i.count, 0);
 
-    if (chestCount < 2) {
+    if (chestCount < requiredChests) {
       // Need to craft chests — check for planks
       const planksHave = countAllPlanks(bot);
-      const planksNeeded = (2 - chestCount) * 8; // 8 planks per chest
+      const planksNeeded = (requiredChests - chestCount) * 8; // 8 planks per chest
 
       if (planksHave < planksNeeded) {
         // Try crafting planks from logs
@@ -184,7 +204,7 @@ export const setupStashSkill: Skill = {
       // Ensure we have a crafting table
       await ensureCraftingTable(bot, signal);
 
-      const chestsToMake = 2 - chestCount;
+      const chestsToMake = requiredChests - chestCount;
       const mcData = mcDataLoader(bot.version);
       const chestMcItem = mcData.itemsByName["chest"];
 
@@ -201,7 +221,7 @@ export const setupStashSkill: Skill = {
         // Navigate to crafting table
         try {
           setMovements(bot);
-          await bot.pathfinder.goto(new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2));
+          await safeGoto(bot, new goals.GoalNear(table.position.x, table.position.y, table.position.z, 2), 15_000);
         } catch {
           /* try anyway */
         }
@@ -244,10 +264,10 @@ export const setupStashSkill: Skill = {
         .filter((i) => i.name === "chest")
         .reduce((sum, i) => sum + i.count, 0);
 
-      if (chestCount < 2) {
+      if (chestCount < requiredChests) {
         return {
           success: false,
-          message: `Only crafted ${chestCount} chests — needed 2. Not enough planks.`,
+          message: `Only crafted ${chestCount} chests — needed ${requiredChests}. Not enough planks.`,
         };
       }
     }
@@ -256,12 +276,12 @@ export const setupStashSkill: Skill = {
       return { success: false, message: "Interrupted while crafting chests." };
     }
 
-    // --- Step 4: Place double chest at stash position ---
+    // --- Step 4: Place and verify new storage capacity ---
     onProgress({
       skillName: "setup_stash",
       phase: "Placing chests",
       progress: 0.7,
-      message: "Placing double chest at stash...",
+      message: expanding ? "Placing a separate expansion chest..." : "Placing double chest at stash...",
       active: true,
     });
 
@@ -272,12 +292,55 @@ export const setupStashSkill: Skill = {
       /* close enough */
     }
 
-    // Place first chest at stashPos
-    const placed1 = await placeChestAt(bot, stashPos);
+    const firstPos = expanding ? findExpansionPosition(bot, stashPos, beforeChestKeys) : stashPos;
+    if (!firstPos) {
+      return {
+        success: false,
+        message: "No safe empty position for an expansion chest within the shared stash area.",
+      };
+    }
+
+    // Place first chest at the selected position.
+    const placed1 = await placeChestAt(bot, firstPos);
     if (!placed1) {
       return {
         success: false,
-        message: "Failed to place first chest at stash position. Check terrain.",
+        message: expanding
+          ? "Failed to place the expansion chest. Check the stash terrain."
+          : "Failed to place first chest at stash position. Check terrain.",
+      };
+    }
+    const verifiedFirst = bot.blockAt(firstPos);
+    if (!verifiedFirst || (verifiedFirst.name !== "chest" && verifiedFirst.name !== "trapped_chest")) {
+      return { success: false, message: "Chest placement returned without a chest block appearing in the world." };
+    }
+
+    if (expanding) {
+      snapshotChest(firstPos, [], 27);
+      const afterPositions = bot.findBlocks({
+        matching: (b) => b.name === "chest" || b.name === "trapped_chest",
+        maxDistance: 10,
+        count: 32,
+      });
+      const afterKeys = new Set(afterPositions.map((position) => `${position.x},${position.y},${position.z}`));
+      const gained = [...afterKeys].filter((key) => !beforeChestKeys.has(key)).length;
+      if (gained < 1) {
+        return {
+          success: false,
+          message: "Expansion chest could not be distinguished from the existing stash; capacity was not verified.",
+        };
+      }
+      onProgress({
+        skillName: "setup_stash",
+        phase: "Done",
+        progress: 1,
+        message: "Shared stash capacity expanded.",
+        active: false,
+      });
+      return {
+        success: true,
+        message: `Placed and verified 1 expansion chest at (${firstPos.x}, ${firstPos.y}, ${firstPos.z}); shared capacity increased by 27 slots.`,
+        stats: { chestsPlaced: 1, slotsAdded: 27 },
       };
     }
 
@@ -303,6 +366,7 @@ export const setupStashSkill: Skill = {
         }
       }
       if (!placedAlt) {
+        snapshotChest(firstPos, [], 27);
         return {
           success: true, // one chest is better than none
           message: `Placed 1 chest at stash (${stashX}, ${stashY}, ${stashZ}) but couldn't place second for double chest. Terrain issue.`,
@@ -310,6 +374,10 @@ export const setupStashSkill: Skill = {
         };
       }
     }
+    // One logical double-chest snapshot. Recording both physical halves would
+    // later double-count capacity when Mineflayer opens either half as a
+    // single 54-slot container.
+    snapshotChest(firstPos, [], 54);
 
     onProgress({
       skillName: "setup_stash",
@@ -328,6 +396,54 @@ export const setupStashSkill: Skill = {
 };
 
 // --- Helpers ---
+
+/**
+ * Expansion chests are deliberately separated from existing chest blocks.
+ * That avoids accidentally targeting an occupied half of a double chest and
+ * makes the capacity increase observable as a new ledger entry.
+ */
+function findExpansionPosition(bot: Bot, stashPos: Vec3, occupied: ReadonlySet<string>): Vec3 | null {
+  const offsets = [
+    [0, 3],
+    [3, 0],
+    [-3, 0],
+    [0, -3],
+    [3, 3],
+    [-3, 3],
+    [3, -3],
+    [-3, -3],
+    [0, 6],
+    [6, 0],
+    [-6, 0],
+    [0, -6],
+  ] as const;
+  for (const [dx, dz] of offsets) {
+    let position: Vec3 | null = null;
+    // Existing chests may sit several blocks above the surrounding terrain
+    // (the current base chest is at Y=78 while nearby ground falls toward
+    // Y=70). Search far enough downward to find real supported ground.
+    for (let y = stashPos.y + 4; y >= stashPos.y - 16; y--) {
+      const candidate = new Vec3(stashPos.x + dx, y, stashPos.z + dz);
+      const target = bot.blockAt(candidate);
+      const below = bot.blockAt(candidate.offset(0, -1, 0));
+      if (
+        target &&
+        (target.name === "air" || target.name === "short_grass" || target.name === "tall_grass") &&
+        below &&
+        below.name !== "air" &&
+        below.name !== "water" &&
+        !below.name.includes("leaves")
+      ) {
+        position = candidate;
+        break;
+      }
+    }
+    if (!position) continue;
+    if (occupied.has(`${position.x},${position.y},${position.z}`)) continue;
+    return position;
+  }
+  return null;
+}
 
 function setMovements(bot: Bot) {
   const moves = new Movements(bot);
@@ -443,7 +559,7 @@ async function placeChestAt(bot: Bot, targetPos: Vec3): Promise<boolean> {
   if (dist > 4) {
     try {
       setMovements(bot);
-      await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
+      await safeGoto(bot, new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2), 12_000);
     } catch {
       /* try anyway */
     }

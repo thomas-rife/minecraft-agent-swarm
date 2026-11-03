@@ -11,7 +11,7 @@
  */
 
 import { getAllMemoryStores } from "../bot/memory-registry.js";
-import { PRECONDITION_KEYWORDS } from "../bot/memory.js";
+import { PRECONDITION_KEYWORDS, STATIC_SKILL_NAMES } from "../bot/memory.js";
 
 export interface SkillStats {
   attempts: number;
@@ -34,8 +34,14 @@ function isPreconditionFailure(notes: string): boolean {
 
 function computeStats(): Map<string, SkillStats> {
   const m = new Map<string, SkillStats>();
+  const seen = new Set<string>();
   for (const store of getAllMemoryStores()) {
     for (const attempt of store.getSkillHistory()) {
+      // Older stores may contain identical records from the former shared
+      // default-array bug. Count one real attempt once, not once per bot file.
+      const attemptKey = `${attempt.skill}|${attempt.success}|${attempt.durationSeconds}|${attempt.timestamp}|${attempt.notes}`;
+      if (seen.has(attemptKey)) continue;
+      seen.add(attemptKey);
       // Precondition failures (missing materials, wrong location) say nothing
       // about whether the skill WORKS — don't let yesterday's wood shortage
       // permanently retire a fixable skill. Successes always count.
@@ -68,9 +74,13 @@ const blockedCounts = new Map<string, number>();
 const PAROLE_EVERY = 10;
 
 /** True when the team has thoroughly proven this skill doesn't work. Pure — no side effects. */
+export function shouldRetireSkill(name: string, stats: SkillStats | undefined): boolean {
+  if (STATIC_SKILL_NAMES.has(name)) return false;
+  return !!stats && stats.attempts >= RETIRE_MIN_ATTEMPTS && stats.rate < RETIRE_RATE;
+}
+
 export function isRetired(name: string): boolean {
-  const s = statsMap().get(name);
-  return !!s && s.attempts >= RETIRE_MIN_ATTEMPTS && s.rate < RETIRE_RATE;
+  return shouldRetireSkill(name, statsMap().get(name));
 }
 
 /**

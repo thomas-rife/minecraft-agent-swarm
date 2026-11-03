@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import { recordOre } from "./memory.js";
+import { getSurfaceState } from "./navigation.js";
 
 export function getWorldContext(bot: Bot): string {
   const pos = bot.entity.position;
@@ -69,28 +70,16 @@ export function getWorldContext(bot: Bot): string {
     );
   }
 
-  // Underground detection: if Y < 80 and no sky access within 20 blocks, bot is underground
-  const feetInWater = bot.blockAt(pos)?.name === "water";
-  if (!feetInWater && pos.y < 80) {
-    // Scan upward for sky (first non-air block above indicates no sky access)
-    let skyAccessY = -1;
-    for (let dy = 1; dy <= 20; dy++) {
-      const b = bot.blockAt(pos.offset(0, dy, 0));
-      if (!b || b.name === "air") continue;
-      skyAccessY = dy;
-      break;
-    }
-    if (skyAccessY !== -1 && skyAccessY <= 10) {
-      // Solid block within 10 blocks above — definitely underground
-      parts.push(
-        `ALERT: Bot is UNDERGROUND (Y=${pos.y.toFixed(0)}, ceiling ${skyAccessY} blocks up). Use 'explore' to reach the surface — you need sunlight for trees and wood gathering. Cannot gather_wood underground.`,
-      );
-    } else if (skyAccessY === -1) {
-      // No ceiling within 20 blocks — might be in open-air at low elevation
-      parts.push(
-        `NOTE: Bot is at low elevation (Y=${pos.y.toFixed(0)}). If no trees nearby, use 'explore' to find forested land.`,
-      );
-    }
+  // Surface detection is based on the actual vertical column, not an arbitrary
+  // Y threshold. A roof at Y=77 and an open ravine at Y=40 are now classified
+  // correctly. Being under cover is informational: it may be a house with a
+  // usable door, so gather_wood gets a chance to path out before digging.
+  const surface = getSurfaceState(bot);
+  if (!surface.inWater && surface.skyKnown && !surface.hasDirectSky) {
+    const ceiling = surface.ceilingDistance !== null ? `, ceiling ${surface.ceilingDistance} blocks above` : "";
+    parts.push(
+      `NOTE: Bot has NO DIRECT SKY ACCESS (Y=${pos.y.toFixed(0)}${ceiling}). Normal actions may still work indoors; gather_wood will try a door or walkable exit before using protected surface-escape logic.`,
+    );
   }
 
   return parts.join("\n");

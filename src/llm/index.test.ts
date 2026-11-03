@@ -82,10 +82,18 @@ const ACTION_ALIASES: Record<string, string> = {
   "generate skill": "generate_skill",
   generateskill: "generate_skill",
   "neural combat": "neural_combat",
+  kill_animal: "attack",
+  "kill animal": "attack",
+  hunt_animal: "attack",
+  "hunt animal": "attack",
+  hunt: "attack",
   "build house": "build_house",
   "build farm": "build_farm",
   "craft gear": "craft_gear",
   "strip mine": "strip_mine",
+  "choose objective": "choose_objective",
+  "choose subobjective": "choose_subobjective",
+  "leave objective": "leave_objective",
   craft_item: "craft",
   crafting: "craft",
 };
@@ -120,11 +128,23 @@ function parseDecision(raw: string): {
   }
 
   const rawAction = (typeof parsed.action === "string" ? parsed.action : "idle").toLowerCase().trim();
-  let action = ACTION_ALIASES[rawAction] ?? (typeof parsed.action === "string" ? parsed.action : "idle");
+  let action = ACTION_ALIASES[rawAction] ?? rawAction;
 
   const params = parsed.params ?? parsed.parameters ?? {};
 
-  for (const field of ["direction", "item", "block", "blockType", "count", "skill", "task", "message"]) {
+  for (const field of [
+    "direction",
+    "item",
+    "block",
+    "blockType",
+    "count",
+    "skill",
+    "task",
+    "message",
+    "objective",
+    "subobjective",
+    "reason",
+  ]) {
     if (parsed[field] !== undefined && params[field] === undefined) {
       params[field] = parsed[field];
     }
@@ -262,6 +282,13 @@ test("parseDecision: normalizes action aliases (say -> chat)", () => {
   assert.equal(result.action, "chat");
 });
 
+test("parseDecision: normalizes hunting aliases to attack", () => {
+  for (const alias of ["kill_animal", "kill animal", "hunt_animal", "hunt animal", "hunt"]) {
+    const result = parseDecision(`{"thought":"food","action":"${alias}","params":{}}`);
+    assert.equal(result.action, "attack");
+  }
+});
+
 test("parseDecision: normalizes craft_item to craft", () => {
   const raw = '{"thought":"crafting","action":"craft_item","params":{"item":"stick"}}';
   const result = parseDecision(raw);
@@ -300,6 +327,18 @@ test("parseDecision: hoists top-level fields into params", () => {
   const raw = '{"thought":"going","action":"explore","direction":"north"}';
   const result = parseDecision(raw);
   assert.equal(result.params.direction, "north");
+});
+
+test("parseDecision: normalizes and hoists hierarchical choices", () => {
+  const objective = parseDecision('{"thought":"Food first","action":"Choose Objective","objective":"food_production"}');
+  assert.equal(objective.action, "choose_objective");
+  assert.equal(objective.params.objective, "food_production");
+
+  const subobjective = parseDecision(
+    '{"thought":"Prepare it","action":"choose subobjective","subobjective":"prepare_farm_supplies"}',
+  );
+  assert.equal(subobjective.action, "choose_subobjective");
+  assert.equal(subobjective.params.subobjective, "prepare_farm_supplies");
 });
 
 test("parseDecision: uses parameters key as fallback for params", () => {

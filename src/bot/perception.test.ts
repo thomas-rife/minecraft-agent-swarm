@@ -208,6 +208,23 @@ test("getWorldContext: no health warning at health=9", () => {
   assert.ok(!ctx.includes("Low health"));
 });
 
+test("getWorldContext: describes a roof at high elevation without declaring gather impossible", () => {
+  const bot = mockBot({
+    position: { x: 10, y: 77, z: 10 },
+    blockAt: (pos: any) => ({ name: pos.y === 80 ? "oak_planks" : "air" }),
+  });
+  const ctx = getWorldContext(bot);
+  assert.ok(ctx.includes("NO DIRECT SKY ACCESS"));
+  assert.ok(ctx.includes("ceiling 3 blocks above"));
+  assert.ok(!ctx.includes("Cannot gather_wood"));
+});
+
+test("getWorldContext: low elevation with open sky is not classified as underground", () => {
+  const ctx = getWorldContext(mockBot({ position: { x: 10, y: 40, z: 10 } }));
+  assert.ok(!ctx.includes("NO DIRECT SKY ACCESS"));
+  assert.ok(!ctx.includes("UNDERGROUND"));
+});
+
 // ── getWorldContext: water detection ─────────────────────────────────────────
 
 test("getWorldContext: alerts when bot is in water", () => {

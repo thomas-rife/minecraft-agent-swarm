@@ -19,7 +19,7 @@ import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import type { Entity } from "prismarine-entity";
 import { config } from "../config.js";
-import { BotRoleConfig, FARM_SITE } from "./role.js";
+import { BotRoleConfig, SETTLEMENT_STRUCTURE_RADIUS } from "./role.js";
 import { queryStrategic, queryReactive, queryCritic, chatWithLLM, type LLMMessage } from "../llm/index.js";
 import type { RoleContext } from "../llm/prompts.js";
 import { getWorldContext, isHostile } from "./perception.js";
@@ -32,12 +32,38 @@ import { abortActiveSkill, isSkillRunning, getActiveSkillName } from "../skills/
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { getAllMemoryStores } from "./memory-registry.js";
-import { updateBulletin, formatTeamBulletin } from "./bulletin.js";
+import { buildProgressionView, reconcileProgression, renderProgressionReport } from "./progression-runtime.js";
+import { observeProgression } from "./progression-observer.js";
+import { evaluateProgression } from "./progression-tree.js";
+import { updateBulletin, formatTeamBulletin, getTeamStatus } from "./bulletin.js";
 import { createLogger } from "../util/logger.js";
 import { recordAction, recordSkillResult, checkInventoryMilestones } from "./scoreboard.js";
-import { getTechTreeLine } from "./curriculum.js";
 import { recordTrajectory } from "./trajectory.js";
+import { actionResultSucceeded } from "./action-result.js";
 import { buildStrategicPrompt } from "../llm/prompts.js";
+import { getDynamicSkillNames } from "../skills/dynamic-loader.js";
+import {
+  assessGoal,
+  assessWoodGatherDecision,
+  formatItemRequirement,
+  formatWoodRequirement,
+  HOUSE_WOOD_TARGET,
+  inventoryCounts,
+  type GoalAssessment,
+} from "./goal-requirements.js";
+import { buildActionMenu, validateDecisionAgainstMenu, type ActionOption } from "./action-menu.js";
+import { getStashSummary } from "../skills/stash-ledger.js";
+import { getTeamEstablishedFarmSites, getTeamFarmSites, inspectFarmLedger } from "../skills/farm-ledger.js";
+import {
+  buildObjectiveDecisionMenu,
+  getAutomaticSubobjectiveDecision,
+  isObjectiveId,
+  reconcileObjectiveCommitment,
+  renderObjectiveTreeReport,
+  type ObjectiveSnapshot,
+  type ObjectiveTreeView,
+  type StructureProgress,
+} from "./objective-tree.js";
 
 export interface ChatMessage {
   source: "minecraft" | "twitch" | "youtube";
@@ -50,6 +76,12 @@ export interface BrainEvents {
   onThought: (thought: string) => void;
   onAction: (action: string, result: string) => void;
   onChat: (message: string) => void;
+}
+
+function uniqueBy<T>(values: readonly T[], key: (value: T) => string): T[] {
+  const unique = new Map<string, T>();
+  for (const value of values) unique.set(key(value), value);
+  return [...unique.values()];
 }
 
 // ─── Event types ────────────────────────────────────────────────────────────
@@ -86,14 +118,48 @@ export class BotBrain {
   // Decision state (migrated from the old decide() function)
   private currentGoal = "";
   private goalStepsLeft = 0;
+  private goalWoodTargetOverride: number | undefined;
   private lastAction = "";
   private lastResultSig = "";
   private sameResultCount = 0;
   private lastResult = "";
   private lastActionWasSuccess = false;
+  private lastActionWasExecuted = true;
   private repeatCount = 0;
   private recentHistory: LLMMessage[] = [];
   private pendingChatMessages: ChatMessage[] = [];
+  private explicitSkillRequests = new Map<string, number>();
+  private objectiveAutoSteps = 0;
+  private objectiveAutoFailures = 0;
+  private lastAutomaticSubobjective = "";
+  private objectiveRecoveryCycles = 0;
+  private objectiveRetryAt = 0;
+  private objectiveRetryTimer: NodeJS.Timeout | null = null;
+
+  /** Allocation-safe counters for the once-per-minute memory monitor. */
+  getDiagnostics(): Record<string, unknown> {
+    return {
+      processing: this.processing,
+      stopped: this.stopped,
+      eventQueue: this.eventQueue.length,
+      recentHistory: this.recentHistory.length,
+      pendingChat: this.pendingChatMessages.length,
+      explicitSkillRequests: this.explicitSkillRequests.size,
+      recentFailures: this.recentFailures.size,
+      failureCounts: this.failureCounts.size,
+      objectiveAutoSteps: this.objectiveAutoSteps,
+      objectiveAutoFailures: this.objectiveAutoFailures,
+      objectiveRecoveryCycles: this.objectiveRecoveryCycles,
+      objectiveRetryInSec: Math.max(0, Math.ceil((this.objectiveRetryAt - Date.now()) / 1000)),
+    };
+  }
+
+  private rememberHistory(message: LLMMessage): void {
+    this.recentHistory.push(message);
+    if (this.recentHistory.length > 12) {
+      this.recentHistory.splice(0, this.recentHistory.length - 8);
+    }
+  }
 
   // Failure tracking
   private recentFailures = new Map<string, string>();
@@ -105,33 +171,62 @@ export class BotBrain {
   // world changes. Structural blocks (wrong-role action, retired skill,
   // hallucinated name) persist long.
   private failureExpiry = new Map<string, number>();
+  private objectiveFailureState = new Map<string, string>();
   private static readonly FAILURE_TTL_TRANSIENT_MS = 120_000;
   private static readonly FAILURE_TTL_STRUCTURAL_MS = 3_600_000;
 
   private blockAction(key: string, msg: string, ttlMs: number = BotBrain.FAILURE_TTL_TRANSIENT_MS): void {
     this.recentFailures.set(key, msg);
-    this.failureExpiry.set(key, Date.now() + ttlMs);
+    if (key.startsWith("objective:")) {
+      this.objectiveFailureState.set(key, this.objectiveStateSignature());
+      this.failureExpiry.set(key, Date.now() + BotBrain.FAILURE_TTL_STRUCTURAL_MS);
+    } else {
+      this.failureExpiry.set(key, Date.now() + ttlMs);
+    }
   }
 
   private purgeExpiredFailures(): void {
     const now = Date.now();
     for (const [k, exp] of this.failureExpiry.entries()) {
-      if (now > exp) {
+      const stateChanged =
+        k.startsWith("objective:") &&
+        this.objectiveFailureState.has(k) &&
+        this.objectiveFailureState.get(k) !== this.objectiveStateSignature();
+      if (now > exp || stateChanged) {
         this.failureExpiry.delete(k);
+        this.objectiveFailureState.delete(k);
         this.recentFailures.delete(k);
         this.failureCounts.delete(k);
       }
     }
+  }
+
+  private objectiveStateSignature(): string {
+    const snapshot = this.buildObjectiveSnapshot();
+    return JSON.stringify({
+      inventory: snapshot.inventory,
+      stashInventory: snapshot.stashInventory,
+      stashFreeSlots: snapshot.stashFreeSlots,
+      structures: snapshot.structures,
+      animals: snapshot.nearbyAnimals,
+      farmLedgerReady: snapshot.farmLedgerReady,
+      farmPlotsTotal: snapshot.farmPlotsTotal,
+      farmPlotsNeedingRepair: snapshot.farmPlotsNeedingRepair,
+      matureWheatNearby: snapshot.matureWheatNearby,
+      nearFarm: snapshot.nearFarm,
+      visibleTrees: snapshot.visibleTrees,
+      position: {
+        x: Math.floor(this.bot.entity.position.x / 8),
+        y: Math.floor(this.bot.entity.position.y / 4),
+        z: Math.floor(this.bot.entity.position.z / 8),
+      },
+    });
   }
   private failureCounts = new Map<string, number>();
   private successesSinceLastExpiry = 0;
 
   // Leash
   private homePos: { x: number; y: number; z: number } | null;
-
-  // Farm override cooldown — a fast-failing skill must not thrash every cycle
-  private lastFarmOverrideMs = 0;
-  private lastIronOverrideMs = 0;
 
   // Chat dedup — the 8B anchors on its own last thought and re-sends the
   // same demand every strategic cycle ("Give me the logs!" x7 in 2 min)
@@ -148,7 +243,7 @@ export class BotBrain {
   private HOSTILE_CHECK_MS = 2000;
   private REACTIVE_COOLDOWN_MS = 3000;
   private STRATEGIC_COOLDOWN_MS = 8000;
-  private CRITIC_ENABLED = true;
+  private CRITIC_ENABLED: boolean;
 
   constructor(bot: Bot, roleConfig: BotRoleConfig, events: BrainEvents, memStore: BotMemoryStore) {
     this.bot = bot;
@@ -158,6 +253,7 @@ export class BotBrain {
     this.log = createLogger(roleConfig.name);
     this.homePos = roleConfig.homePos ?? null;
     this.IDLE_INTERVAL_MS = config.bot.idleIntervalMs ?? 10_000;
+    this.CRITIC_ENABLED = config.bot.criticEnabled;
 
     // Pre-populate failure blacklist from memory
     for (const [skill, msg] of memStore.getSessionPreconditionBlocks()) {
@@ -298,6 +394,7 @@ export class BotBrain {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.hostileScanner) clearInterval(this.hostileScanner);
     if (this.overlayInterval) clearInterval(this.overlayInterval);
+    if (this.objectiveRetryTimer) clearTimeout(this.objectiveRetryTimer);
   }
 
   /** Queue a chat message for processing. */
@@ -307,6 +404,7 @@ export class BotBrain {
       this.log.debug("Brain", `Filtered viewer message from ${msg.username}: ${viewerFilter.reason}`);
       msg.message = viewerFilter.cleaned;
     }
+    this.rememberExplicitSkillRequests(msg.message);
     this.pendingChatMessages.push(msg);
     if (this.pendingChatMessages.length > 10) this.pendingChatMessages.shift();
 
@@ -511,8 +609,345 @@ export class BotBrain {
 
   // ─── Context building ─────────────────────────────────────────────────────
 
+  private nearbyCraftingTable(): boolean {
+    try {
+      return !!this.bot.findBlock({
+        matching: (block) => block.name === "crafting_table",
+        maxDistance: 32,
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private assessActiveGoal(action?: string, result?: string): GoalAssessment {
+    if (!this.currentGoal) return { goalComplete: false };
+    return assessGoal(this.currentGoal, inventoryCounts(this.bot.inventory.items()), {
+      action,
+      result,
+      nearbyCraftingTable: this.nearbyCraftingTable(),
+      woodTargetOverride: this.goalWoodTargetOverride,
+    });
+  }
+
+  private clearActiveGoal(reason: string): void {
+    if (!this.currentGoal) return;
+    this.log.info("Brain:goal", `Goal "${this.currentGoal}" cleared: ${reason}. Re-planning.`);
+    this.currentGoal = "";
+    this.goalStepsLeft = 0;
+    this.goalWoodTargetOverride = undefined;
+  }
+
+  /**
+   * Models often repeat the same `goal` field on every decision. Resetting its
+   * step budget each time made stale goals immortal, so only a genuinely new
+   * goal gets a fresh budget.
+   */
+  private activateGoal(goal: string | undefined, steps?: number): void {
+    const next = goal?.trim();
+    if (!next) return;
+    const normalize = (value: string) =>
+      value
+        .toLowerCase()
+        .replace(/[^\w]+/g, " ")
+        .trim();
+    if (this.currentGoal && normalize(this.currentGoal) === normalize(next)) return;
+    this.currentGoal = next;
+    this.goalStepsLeft = Math.max(1, Math.min(Number(steps) || 5, 20));
+    this.goalWoodTargetOverride = undefined;
+    this.log.debug("Brain:goal", `New goal "${next}" (${this.goalStepsLeft} steps)`);
+  }
+
+  private reconcileActiveGoal(action?: string, result?: string): GoalAssessment {
+    if (!this.currentGoal) return { goalComplete: false };
+    const assessment = this.assessActiveGoal(action, result);
+    if (assessment.goalComplete) {
+      this.clearActiveGoal(assessment.goalCompleteReason ?? "deterministic requirement satisfied");
+    }
+    return assessment;
+  }
+
+  private inventoryRecord(items: { name: string; count: number }[]): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const item of items) counts[item.name] = (counts[item.name] ?? 0) + item.count;
+    return counts;
+  }
+
+  private belongsToCurrentSettlement(structure: { type: string; x: number; z: number }): boolean {
+    if (!["house", "warehouse", "workshop", "mine", "furnace", "animal_pen"].includes(structure.type)) return true;
+    const anchor = this.roleConfig.stashPos;
+    if (!anchor) return true;
+    return Math.hypot(structure.x - anchor.x, structure.z - anchor.z) <= SETTLEMENT_STRUCTURE_RADIUS;
+  }
+
+  private buildObjectiveSnapshot(): ObjectiveSnapshot {
+    const carried = this.inventoryRecord(this.bot.inventory.items());
+    const teamInventory: Record<string, number> = { ...carried };
+    const teammates = getTeamStatus(this.roleConfig.name);
+    const freshTeammates = teammates.filter((teammate) => Date.now() - teammate.timestamp <= 30_000);
+    for (const teammate of freshTeammates) {
+      for (const [name, count] of Object.entries(teammate.inventory ?? {})) {
+        teamInventory[name] = (teamInventory[name] ?? 0) + count;
+      }
+    }
+
+    const stores = getAllMemoryStores();
+    const structures = uniqueBy(
+      stores
+        .flatMap((store) => [...store.getStructures()])
+        .filter((structure) => this.belongsToCurrentSettlement(structure)),
+      (structure) =>
+        `${structure.type}|${structure.x}|${structure.y}|${structure.z}|${structure.builtAt}|${structure.notes ?? ""}`,
+    );
+    const structureProgress = (type: "house" | "farm" | "warehouse" | "workshop" | "mine"): StructureProgress => {
+      const matching = structures.filter((structure) => structure.type === type);
+      if (matching.some((structure) => !(structure.notes ?? "").toLowerCase().includes("partial"))) {
+        return "complete";
+      }
+      return matching.length > 0 ? "partial" : "missing";
+    };
+    const farm = structures.find(
+      (structure) => structure.type === "farm" && !(structure.notes ?? "").toLowerCase().includes("partial"),
+    );
+    const house = structures.find(
+      (structure) => structure.type === "house" && !(structure.notes ?? "").toLowerCase().includes("partial"),
+    );
+    const mine = structures.find(
+      (structure) => structure.type === "mine" && !(structure.notes ?? "").toLowerCase().includes("partial"),
+    );
+    const animalPens = new Set(
+      structures
+        .filter((structure) => structure.type === "animal_pen" && /status=established/i.test(structure.notes ?? ""))
+        .map((structure) => /species=([a-z_]+)/i.exec(structure.notes ?? "")?.[1])
+        .filter((species): species is string => !!species),
+    );
+    const rememberedFarmSite = getTeamFarmSites()
+      .filter((site) => site.status === "reachable" || site.status === "planted")
+      .sort((a, b) => {
+        const rank = { planted: 3, reachable: 2, discovered: 1 } as const;
+        const statusDifference = rank[b.status as keyof typeof rank] - rank[a.status as keyof typeof rank];
+        if (statusDifference !== 0) return statusDifference;
+        return (
+          this.bot.entity.position.distanceTo(new Vec3(a.approach.x, a.approach.y, a.approach.z)) -
+          this.bot.entity.position.distanceTo(new Vec3(b.approach.x, b.approach.y, b.approach.z))
+        );
+      })[0];
+    const establishedFarmSites = getTeamEstablishedFarmSites().sort(
+      (a, b) =>
+        this.bot.entity.position.distanceTo(new Vec3(a.approach.x, a.approach.y, a.approach.z)) -
+        this.bot.entity.position.distanceTo(new Vec3(b.approach.x, b.approach.y, b.approach.z)),
+    );
+    const farmLedgerReady =
+      establishedFarmSites.length > 0 && establishedFarmSites.every((site) => (site.plots?.length ?? 0) > 0);
+    const farmInspection = inspectFarmLedger(this.bot, establishedFarmSites);
+
+    const allSkillHistory = uniqueBy(
+      stores.flatMap((store) => store.getSkillHistory()),
+      (attempt) =>
+        `${attempt.skill}|${attempt.success}|${attempt.durationSeconds}|${attempt.timestamp}|${attempt.notes}`,
+    );
+    const scoutedSectors = new Set(
+      stores
+        .flatMap((store) => [...store.getScoutSectors()])
+        .filter(
+          (record) =>
+            !this.roleConfig.stashPos ||
+            Math.hypot(
+              record.waypoint.x - this.roleConfig.stashPos.x,
+              record.waypoint.z - this.roleConfig.stashPos.z,
+            ) <= 100,
+        )
+        .map((record) => record.id),
+    );
+    const safetyZones = new Set(
+      stores
+        .flatMap((store) => [...store.getSafetyZones()])
+        .filter(
+          (record) =>
+            !this.roleConfig.stashPos ||
+            Math.hypot(record.center.x - this.roleConfig.stashPos.x, record.center.z - this.roleConfig.stashPos.z) <=
+              SETTLEMENT_STRUCTURE_RADIUS,
+        )
+        .map((record) => record.zone),
+    );
+    const currentMineStartedAt = structures
+      .filter((structure) => structure.type === "mine")
+      .map((structure) => Date.parse(structure.builtAt))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b)[0];
+    const ironToolEstablished = allSkillHistory.some(
+      (attempt) =>
+        attempt.success &&
+        attempt.skill === "craft_gear" &&
+        /\b(?:iron|diamond|netherite)_pickaxe\b/i.test(attempt.notes) &&
+        Number.isFinite(currentMineStartedAt) &&
+        Date.parse(attempt.timestamp) >= currentMineStartedAt,
+    );
+    const furnaceEstablished =
+      structures.some(
+        (structure) => structure.type === "furnace" && !(structure.notes ?? "").toLowerCase().includes("partial"),
+      ) ||
+      allSkillHistory.some(
+        (attempt) =>
+          attempt.success &&
+          attempt.skill === "smelt_ores" &&
+          Number.isFinite(currentMineStartedAt) &&
+          Date.parse(attempt.timestamp) >= currentMineStartedAt,
+      );
+    const stashSummary = getStashSummary();
+    const stashExists =
+      stashSummary.chestCount > 0 ||
+      allSkillHistory.some((attempt) => attempt.skill === "setup_stash" && attempt.success);
+    const shelterLit = safetyZones.has("lodge");
+
+    let nearbyWater = false;
+    let visibleTrees = false;
+    let nearbyCraftingTable = false;
+    let matureWheatNearby = 0;
+    const nearbyAnimals: Record<string, number> = { cow: 0, sheep: 0, chicken: 0, pig: 0 };
+    try {
+      nearbyWater = !!this.bot.findBlock({
+        matching: (block) => block.name === "water",
+        maxDistance: 48,
+      });
+      visibleTrees = !!this.bot.findBlock({
+        matching: (block) =>
+          block.name.endsWith("_log") || block.name.endsWith("_stem") || block.name.endsWith("_hyphae"),
+        maxDistance: 64,
+      });
+      nearbyCraftingTable = !!this.bot.findBlock({
+        matching: (block) => block.name === "crafting_table",
+        maxDistance: 32,
+      });
+      matureWheatNearby = farmInspection.maturePlots;
+      for (const entity of Object.values(this.bot.entities)) {
+        if (!entity?.position || this.bot.entity.position.distanceTo(entity.position) > 96) continue;
+        const name = String((entity as any).name ?? (entity as any).mobType ?? "").toLowerCase();
+        if (name in nearbyAnimals) nearbyAnimals[name]++;
+      }
+    } catch {
+      // Missing chunks mean "not observed", never a fabricated positive fact.
+    }
+
+    const primaryEstablishedFarm = establishedFarmSites[0];
+    const farmLocation = primaryEstablishedFarm
+      ? { ...primaryEstablishedFarm.water }
+      : farm
+        ? { x: farm.x, y: farm.y, z: farm.z }
+        : rememberedFarmSite
+          ? { ...rememberedFarmSite.water }
+          : undefined;
+    const houseLocation = house ? { x: house.x + 4, y: house.y + 1, z: house.z + 4 } : undefined;
+    const mineLocation = mine ? { x: mine.x, y: mine.y, z: mine.z } : undefined;
+    const nearFarm = establishedFarmSites.some(
+      (site) => this.bot.entity.position.distanceTo(new Vec3(site.water.x, site.water.y, site.water.z)) <= 48,
+    );
+    const inventoryItems = Object.values(carried).reduce((total, count) => total + count, 0);
+
+    return {
+      botName: this.roleConfig.name,
+      role: this.roleConfig.role,
+      position: {
+        x: Math.floor(this.bot.entity.position.x),
+        y: Math.floor(this.bot.entity.position.y),
+        z: Math.floor(this.bot.entity.position.z),
+      },
+      settlementAnchor: this.roleConfig.stashPos ? { ...this.roleConfig.stashPos } : undefined,
+      inventory: carried,
+      teamInventory,
+      stashInventory: stashSummary.items,
+      structures: {
+        house: structureProgress("house"),
+        farm: structureProgress("farm"),
+        warehouse: structureProgress("warehouse"),
+        workshop: structureProgress("workshop"),
+        mine: structureProgress("mine"),
+      },
+      stashExists,
+      progressionStorage: {
+        chestCount: Math.ceil(stashSummary.totalSlots / 27),
+        deposited: stores.some((store) => store.getProgressionStorage().deposited),
+        retrieved: stores.some((store) => store.getProgressionStorage().retrieved),
+      },
+      stashFreeSlots: stashSummary.totalSlots > 0 ? stashSummary.freeSlots : null,
+      stashTotalSlots: stashSummary.totalSlots > 0 ? stashSummary.totalSlots : null,
+      shelterLit,
+      ironToolEstablished,
+      furnaceEstablished,
+      usableFarmSite: !!farm || !!rememberedFarmSite,
+      nearbyWater,
+      visibleTrees,
+      nearbyCraftingTable,
+      nearFarm,
+      farmLocation,
+      houseLocation,
+      mineLocation,
+      scoutedSectors: scoutedSectors.size,
+      safetyZones,
+      nearbyAnimals,
+      animalPens,
+      farmLedgerReady,
+      farmPlotsTotal: farmInspection.totalPlots,
+      farmPlotsNeedingRepair: farmInspection.repairPlots,
+      matureWheatNearby,
+      inventoryStacks: this.bot.inventory.items().length,
+      inventoryItems,
+      recentlyFailed: new Set(this.recentFailures.keys()),
+      teamCommitments: freshTeammates.map((teammate) => ({
+        name: teammate.name,
+        objectiveId: teammate.objectiveId,
+        subobjectiveId: teammate.subobjectiveId,
+      })),
+    };
+  }
+
+  private objectiveTreeView(reconcile = true): ObjectiveTreeView {
+    this.purgeExpiredFailures();
+    const stores = [...new Set([this.memStore, ...getAllMemoryStores()])];
+    const previous = { completedObjectives: [...new Set(stores.flatMap((store) => store.getProgressionObjectives()))] };
+    const anchor = this.roleConfig.stashPos ?? this.homePos;
+    const state = anchor ? reconcileProgression(previous, observeProgression(this.bot, anchor)) : previous;
+    const newlyVerified = state.completedObjectives.filter((id) => !previous.completedObjectives.includes(id));
+    for (const store of stores) store.saveProgressionObjectives(state.completedObjectives);
+    if (newlyVerified.length) {
+      const priorLocked = new Set(
+        evaluateProgression(previous)
+          .filter((stage) => stage.status === "locked")
+          .map((stage) => stage.id),
+      );
+      const unlocked = evaluateProgression(state).filter(
+        (stage) => stage.status !== "locked" && priorLocked.has(stage.id),
+      );
+      const message = `Verified team milestones: ${newlyVerified.join(", ")}${unlocked.length ? `. Unlocked: ${unlocked.map((stage) => stage.label).join(", ")}` : ""}`;
+      this.log.info("Brain:progression", message);
+      this.events.onAction("progression", message);
+    }
+    let view = buildProgressionView(this.buildObjectiveSnapshot(), state, this.memStore.getObjectiveCommitment());
+    if (!reconcile || !view.commitment) return view;
+
+    const reconciled = reconcileObjectiveCommitment(view);
+    if (!reconciled.reason) return view;
+
+    this.log.info("Brain:objective", reconciled.reason);
+    if (!reconciled.commitment) {
+      this.memStore.clearObjectiveCommitment(reconciled.reason);
+    } else {
+      this.memStore.replaceObjectiveCommitment(reconciled.commitment);
+    }
+    view = buildProgressionView(this.buildObjectiveSnapshot(), state, this.memStore.getObjectiveCommitment());
+    return view;
+  }
+
   /** Build the world context string for strategic decisions. */
   private buildContext(): string {
+    // Re-check against current inventory before every strategic call. This
+    // catches items received from teammates or crafted/placed between turns.
+    if (this.currentGoal && this.goalStepsLeft <= 0) {
+      this.clearActiveGoal("step budget exhausted");
+    } else {
+      this.reconcileActiveGoal();
+    }
+
     const worldContext = getWorldContext(this.bot);
     let ctx = `CURRENT STATE:\n${worldContext}`;
 
@@ -523,13 +958,17 @@ export class BotBrain {
       this.pendingChatMessages.length = 0;
     }
 
-    // Tech-tree curriculum — deterministic "what's next" from inventory
-    const techLine = getTechTreeLine(this.bot, this.roleConfig.role);
-    if (techLine) ctx += `\n\n${techLine}`;
+    // Hierarchical settlement state replaces the old one-line inventory ladder.
+    // It exposes needs and choices without selecting an objective for the LLM.
+    ctx += `\n\n${renderObjectiveTreeReport(this.objectiveTreeView())}`;
+    ctx += `\n\n${renderProgressionReport({ completedObjectives: this.memStore.getProgressionObjectives() })}`;
 
     // Current goal
     if (this.currentGoal && this.goalStepsLeft > 0) {
       ctx += `\n\nCURRENT GOAL: "${this.currentGoal}" (${this.goalStepsLeft} steps left). Continue.`;
+      const assessment = this.assessActiveGoal();
+      if (assessment.wood) ctx += `\n${formatWoodRequirement(assessment.wood)}`;
+      if (assessment.item) ctx += `\n${formatItemRequirement(assessment.item)}`;
     }
 
     // Last action result
@@ -557,6 +996,19 @@ export class BotBrain {
     const teamStatus = formatTeamBulletin(this.roleConfig.name);
     if (teamStatus) ctx += `\n${teamStatus}`;
 
+    if (this.roleConfig.allowedSkills.includes("build_structure")) {
+      const structures = getAllMemoryStores()
+        .flatMap((store) => [...store.getStructures()])
+        .filter((structure) => this.belongsToCurrentSettlement(structure));
+      const status = (type: "house" | "warehouse" | "workshop") => {
+        const matches = structures.filter((structure) => structure.type === type);
+        if (matches.some((structure) => !(structure.notes ?? "").includes("(partial)"))) return "complete";
+        if (matches.length > 0) return "PARTIAL — resume it";
+        return "missing";
+      };
+      ctx += `\n\nSETTLEMENT PROJECTS: house=${status("house")}; warehouse=${status("warehouse")}; workshop=${status("workshop")}. Build in that order and finish partial projects first.`;
+    }
+
     // Recent failures
     this.purgeExpiredFailures();
     if (this.recentFailures.size > 0) {
@@ -569,6 +1021,281 @@ export class BotBrain {
 
     ctx += "\n\nWhat should you do next? Respond with JSON.";
     return ctx;
+  }
+
+  /** Flat mechanical affordances used as leaves beneath the objective tree. */
+  private baseActionMenu(): ActionOption[] {
+    this.purgeExpiredFailures();
+    this.rememberExplicitSkillRequests(this.memStore.getSeasonGoal() ?? "");
+    const now = Date.now();
+    for (const [name, expiresAt] of this.explicitSkillRequests) {
+      if (expiresAt <= now) this.explicitSkillRequests.delete(name);
+    }
+    const completeStructures = new Set<string>();
+    const knownLocations: { x: number; y: number; z: number; label: string }[] = [];
+    for (const store of getAllMemoryStores()) {
+      for (const structure of store.getStructures()) {
+        if (!this.belongsToCurrentSettlement(structure)) continue;
+        if (!(structure.notes ?? "").includes("(partial)")) {
+          completeStructures.add(structure.type);
+          knownLocations.push({
+            x: structure.x,
+            y: structure.y,
+            z: structure.z,
+            label: structure.type,
+          });
+        }
+      }
+      for (const site of store.getFarmSites()) {
+        if (site.status === "blocked") continue;
+        knownLocations.push({
+          ...site.approach,
+          label: `farm shore (${site.status})`,
+        });
+      }
+    }
+    if (this.roleConfig.stashPos) {
+      knownLocations.unshift({ ...this.roleConfig.stashPos, label: "stash/base" });
+    }
+    if (this.homePos) {
+      knownLocations.push({ ...this.homePos, label: "home" });
+    }
+    const assessment = this.currentGoal ? this.assessActiveGoal() : { goalComplete: false as const };
+    return buildActionMenu(this.bot, {
+      roleName: this.roleConfig.name,
+      role: this.roleConfig.role,
+      preferredActions: this.roleConfig.allowedActions,
+      preferredSkills: this.roleConfig.allowedSkills,
+      goal: this.currentGoal,
+      recentlyFailed: new Set(this.recentFailures.keys()),
+      stashPos: this.roleConfig.stashPos,
+      structures: completeStructures,
+      woodNeeded: assessment.wood ? !assessment.wood.satisfied : false,
+      pendingPlayerMessage: this.pendingChatMessages.length > 0,
+      explicitlyRequestedSkills: new Set(this.explicitSkillRequests.keys()),
+      knownLocations: knownLocations.filter(
+        (location, index, all) =>
+          all.findIndex(
+            (candidate) => candidate.x === location.x && candidate.y === location.y && candidate.z === location.z,
+          ) === index,
+      ),
+    });
+  }
+
+  /** One canonical hierarchical menu feeds the model and final execution gate. */
+  private currentActionMenu(): ActionOption[] {
+    const base = this.baseActionMenu();
+    return buildObjectiveDecisionMenu(this.objectiveTreeView(), base);
+  }
+
+  private rememberExplicitSkillRequests(text: string): void {
+    const normalize = (value: string) =>
+      value
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+    const normalizedText = normalize(text);
+    if (!normalizedText) return;
+    for (const name of getDynamicSkillNames()) {
+      const normalizedName = normalize(name);
+      if (normalizedName.length >= 6 && normalizedText.includes(normalizedName)) {
+        this.explicitSkillRequests.set(name, Date.now() + 10 * 60_000);
+      }
+    }
+  }
+
+  private publishBulletin(action: string, thought: string, result: string): void {
+    const commitment = this.memStore.getObjectiveCommitment();
+    updateBulletin({
+      name: this.roleConfig.name,
+      action,
+      position: {
+        x: this.bot.entity.position.x,
+        y: this.bot.entity.position.y,
+        z: this.bot.entity.position.z,
+      },
+      thought,
+      health: this.bot.health,
+      food: this.bot.food,
+      timestamp: Date.now(),
+      goal: this.currentGoal || commitment?.objectiveId,
+      lastResult: result.slice(0, 120),
+      inventory: this.inventoryRecord(this.bot.inventory.items()),
+      objectiveId: commitment?.objectiveId,
+      subobjectiveId: commitment?.subobjectiveId,
+    });
+  }
+
+  private scheduleHierarchicalContinuation(delayMs = 250): void {
+    // Objective/sub-objective descent is one logical decision cycle. Bypass
+    // the ordinary strategic cooldown so it does not add 8-10 seconds between
+    // selecting a branch and Mineflayer starting its deterministic procedure.
+    this.lastStrategicMs = 0;
+    setTimeout(() => this.triggerReplan(), delayMs);
+  }
+
+  private resetObjectiveRecovery(): void {
+    this.objectiveRecoveryCycles = 0;
+    this.objectiveRetryAt = 0;
+    if (this.objectiveRetryTimer) clearTimeout(this.objectiveRetryTimer);
+    this.objectiveRetryTimer = null;
+  }
+
+  private scheduleObjectiveRetry(delayMs: number): void {
+    this.objectiveRetryAt = Math.max(this.objectiveRetryAt, Date.now() + delayMs);
+    if (this.objectiveRetryTimer) return;
+    this.objectiveRetryTimer = setTimeout(
+      () => {
+        this.objectiveRetryTimer = null;
+        if (this.stopped) return;
+        this.triggerReplan();
+      },
+      Math.max(250, this.objectiveRetryAt - Date.now()),
+    );
+    this.objectiveRetryTimer.unref?.();
+  }
+
+  private deferActiveSubobjective(subobjectiveId: string, reason: string, delayMs: number): void {
+    this.objectiveRecoveryCycles++;
+    this.objectiveAutoSteps = 0;
+    this.objectiveAutoFailures = 0;
+
+    // Give deterministic recovery several bounded chances without paying for
+    // another objective/sub-objective LLM round every six seconds. After five
+    // unchanged recovery windows, release and cooldown the branch so another
+    // genuinely useful objective can be chosen.
+    if (this.objectiveRecoveryCycles >= 5) {
+      this.blockAction(`objective:${subobjectiveId}`, `${subobjectiveId} blocked after recovery: ${reason}`);
+      this.memStore.clearObjectiveSubobjective();
+      this.lastResult = `${subobjectiveId} released after five deterministic recovery windows: ${reason}`;
+      this.resetObjectiveRecovery();
+      this.events.onAction("objective_blocked", this.lastResult);
+      this.scheduleHierarchicalContinuation();
+      return;
+    }
+
+    this.lastResult = `${subobjectiveId} paused for deterministic recovery (${this.objectiveRecoveryCycles}/5): ${reason}`;
+    this.lastActionWasSuccess = false;
+    this.lastActionWasExecuted = false;
+    this.events.onAction("objective_recovery", this.lastResult);
+    this.scheduleObjectiveRetry(delayMs);
+  }
+
+  private rejectObjectiveControl(action: string, reason: string): void {
+    const result = `Rejected before execution: ${reason}`;
+    this.events.onAction(action, result);
+    this.lastAction = action;
+    this.lastResult = result;
+    this.lastActionWasSuccess = false;
+    this.lastActionWasExecuted = false;
+    this.rememberHistory({
+      role: "assistant",
+      content: `My proposed ${action} was rejected before execution: ${reason}`,
+    });
+    this.scheduleHierarchicalContinuation();
+  }
+
+  private handleObjectiveControlDecision(
+    decision: {
+      thought: string;
+      action: string;
+      params: Record<string, any>;
+    },
+    advertisedMenu: readonly ActionOption[],
+  ): void {
+    const params = { ...(decision.params ?? {}) };
+    const validation = validateDecisionAgainstMenu(this.bot, { action: decision.action, params }, advertisedMenu);
+    if (!validation.ok) {
+      this.rejectObjectiveControl(decision.action, validation.reason ?? "invalid objective choice");
+      return;
+    }
+
+    let result = "";
+    if (decision.action === "choose_objective") {
+      const objective = String(params.objective ?? "");
+      if (!isObjectiveId(objective)) {
+        this.rejectObjectiveControl(decision.action, `"${objective}" is not a known objective.`);
+        return;
+      }
+      this.clearActiveGoal("hierarchical project selected");
+      this.memStore.chooseObjective(objective, decision.thought);
+      this.objectiveAutoSteps = 0;
+      this.objectiveAutoFailures = 0;
+      this.lastAutomaticSubobjective = "";
+      this.resetObjectiveRecovery();
+      result = `Committed to objective: ${objective}. Choose an approach next.`;
+    } else if (decision.action === "choose_subobjective") {
+      const subobjective = String(params.subobjective ?? "");
+      const commitment = this.memStore.chooseSubobjective(subobjective);
+      if (!commitment) {
+        this.rejectObjectiveControl(decision.action, "Choose a high-level objective first.");
+        return;
+      }
+      this.objectiveAutoSteps = 0;
+      this.objectiveAutoFailures = 0;
+      this.lastAutomaticSubobjective = subobjective;
+      this.resetObjectiveRecovery();
+      result = `Committed to sub-objective: ${subobjective}. Mineflayer will execute its procedure automatically.`;
+    } else {
+      const reason = String(params.reason ?? decision.thought ?? "reprioritized");
+      this.memStore.clearObjectiveCommitment(reason);
+      this.objectiveAutoSteps = 0;
+      this.objectiveAutoFailures = 0;
+      this.lastAutomaticSubobjective = "";
+      this.resetObjectiveRecovery();
+      result = `Left the active objective: ${reason}`;
+    }
+
+    this.lastAction = decision.action;
+    this.lastResult = result;
+    this.lastActionWasSuccess = true;
+    this.lastActionWasExecuted = false;
+    this.events.onAction(decision.action, result);
+    this.publishBulletin(decision.action, decision.thought, result);
+    this.rememberHistory({
+      role: "assistant",
+      content: `${decision.thought}. ${result}`,
+    });
+    this.scheduleHierarchicalContinuation();
+  }
+
+  private async runActiveSubobjective(): Promise<void> {
+    const view = this.objectiveTreeView();
+    const subobjective = view.activeSubobjective;
+    if (!subobjective) {
+      this.scheduleHierarchicalContinuation();
+      return;
+    }
+
+    if (this.lastAutomaticSubobjective !== subobjective.id) {
+      this.lastAutomaticSubobjective = subobjective.id;
+      this.objectiveAutoSteps = 0;
+      this.objectiveAutoFailures = 0;
+      this.resetObjectiveRecovery();
+    }
+    if (this.objectiveRetryAt > Date.now()) {
+      this.scheduleObjectiveRetry(this.objectiveRetryAt - Date.now());
+      return;
+    }
+    if (this.objectiveAutoSteps >= 12) {
+      const reason = `${subobjective.label} made twelve automatic steps without reaching its completion evidence.`;
+      this.deferActiveSubobjective(subobjective.id, reason, 120_000);
+      return;
+    }
+
+    const baseMenu = this.baseActionMenu();
+    const advertisedMenu = buildObjectiveDecisionMenu(view, baseMenu);
+    const automatic = getAutomaticSubobjectiveDecision(view, baseMenu);
+    if (!automatic) {
+      const reason = `${subobjective.label} has no executable procedure in the current state. Choose another approach.`;
+      this.deferActiveSubobjective(subobjective.id, reason, 120_000);
+      return;
+    }
+
+    this.objectiveAutoSteps++;
+    this.events.onThought(`[${subobjective.label}] ${automatic.thought}`);
+    await this.executeDecision(automatic, "objective", advertisedMenu);
   }
 
   // ─── Event handlers ───────────────────────────────────────────────────────
@@ -609,8 +1336,14 @@ export class BotBrain {
       situation = `Health: ${this.bot.health}/20, Food: ${this.bot.food}/20. Assess situation.`;
     }
 
-    const decision = await queryReactive(this.roleConfig.name, situation, this.roleConfig.allowedActions);
-    await this.executeDecision(decision);
+    const reactiveMenu = this.currentActionMenu().filter((option) =>
+      ["eat", "flee", "attack", "neural_combat"].includes(option.action),
+    );
+    const decision = await queryReactive(this.roleConfig.name, situation, reactiveMenu);
+    await this.executeDecision(decision, "llm", reactiveMenu);
+    if (this.objectiveTreeView().activeSubobjective) {
+      this.scheduleHierarchicalContinuation();
+    }
   }
 
   private async handleChat(event: BrainEvent): Promise<void> {
@@ -684,141 +1417,49 @@ export class BotBrain {
       const dist = Math.sqrt(dx * dx + dz * dz);
       if (dist >= this.roleConfig.leashRadius * 1.5) {
         this.log.info("Brain", `LEASH: ${dist.toFixed(0)} blocks away — forcing return home`);
-        const result = await executeAction(this.bot, "go_to", this.homePos);
+        const directDistance = this.bot.entity.position.distanceTo(
+          new Vec3(this.homePos.x, this.homePos.y, this.homePos.z),
+        );
+        const returnTarget =
+          directDistance <= 190
+            ? this.homePos
+            : {
+                x: Math.round(
+                  this.bot.entity.position.x + (this.homePos.x - this.bot.entity.position.x) * (180 / directDistance),
+                ),
+                y: Math.round(this.bot.entity.position.y),
+                z: Math.round(
+                  this.bot.entity.position.z + (this.homePos.z - this.bot.entity.position.z) * (180 / directDistance),
+                ),
+              };
+        const result = await executeAction(this.bot, "go_to", returnTarget);
         this.events.onAction("go_to", result);
         return;
       }
     }
 
-    // Stash bootstrap override — deterministic, like the leash. The LLM
-    // reliably circles this goal (hand-placing chests, re-gathering wood)
-    // without ever picking setup_stash, so when the preconditions are met
-    // we just run it.
-    if (
-      config.bot.allowInterventions &&
-      this.roleConfig.allowedSkills.includes("setup_stash") &&
-      this.roleConfig.stashPos &&
-      !this.recentFailures.has("skill:setup_stash")
-    ) {
-      const { x, y, z } = this.roleConfig.stashPos;
-      const nearStash = this.bot.entity.position.distanceTo(new Vec3(x, y, z)) < 64;
-      const chestAtStash = this.bot.findBlock({
-        matching: (b) => b.name === "chest" || b.name === "trapped_chest",
-        maxDistance: 16,
-        point: new Vec3(x, y, z),
-      });
-      const logsAndPlanks = this.bot.inventory
-        .items()
-        .reduce(
-          (s, i) => s + (i.name.endsWith("_log") ? i.count * 4 : 0) + (i.name.endsWith("_planks") ? i.count : 0),
-          0,
-        );
-      const chestsHeld = this.bot.inventory
-        .items()
-        .filter((i) => i.name === "chest")
-        .reduce((s, i) => s + i.count, 0);
-      if (nearStash && !chestAtStash && (logsAndPlanks >= 16 || chestsHeld >= 2)) {
-        this.log.info("Brain", "OVERRIDE: materials ready and no stash chest — running setup_stash");
-        this.events.onThought("The Stash must rise. I have the materials. No more excuses.");
-        const result = await executeAction(this.bot, "invoke_skill", { skill: "setup_stash", x, y, z });
-        this.events.onAction("setup_stash", result);
-        this.lastAction = "setup_stash";
-        this.lastResult = result;
-        this.trackFailure(
-          "skill:setup_stash",
-          { action: "setup_stash", params: {} },
-          result,
-          /bootstrapped|already/i.test(result),
-        );
-        return;
-      }
+    // Once the LLM has selected a sub-objective, it is no longer asked to
+    // choose individual skills. Resume the stored deterministic procedure
+    // directly (including after a restart) until it completes or blocks.
+    if (this.objectiveTreeView().activeSubobjective) {
+      await this.runActiveSubobjective();
+      return;
     }
 
-    // Farm bootstrap override — deterministic, like the stash. Flora spent
-    // 45 minutes in the wood-acquisition layer without once invoking
-    // build_farm; the skill is now fully self-sufficient (travels to the
-    // lake, chops its own logs, crafts the hoe), so when there's no farm
-    // yet we just run it.
-    // NOTE: deliberately NOT gated on recentFailures. The override's whole
-    // job is to force the farm past the LLM's avoidance and past stale
-    // precondition blocks (the chunk-load bug recorded many "No water found"
-    // failures that pre-loaded as a blacklist entry every restart, which then
-    // blocked the override from ever firing). Cooldown alone bounds retries.
-    if (
-      config.bot.allowInterventions &&
-      this.roleConfig.allowedSkills.includes("build_farm") &&
-      !isSkillRunning(this.bot)
-    ) {
-      const hasFarm = getAllMemoryStores().some((st) =>
-        st.hasStructureNearby(
-          "farm",
-          this.bot.entity.position.x,
-          this.bot.entity.position.y,
-          this.bot.entity.position.z,
-          300,
-        ),
-      );
-      // No day-gate: a Minecraft day is only ~20 real minutes, so day-gating
-      // meant the farm rarely got a window — crops grow fine at night and the
-      // skill handles its own safety. Cooldown alone prevents thrash.
-      const cooledDown = Date.now() - this.lastFarmOverrideMs > 240_000;
-      if (!hasFarm && cooledDown) {
-        this.lastFarmOverrideMs = Date.now();
-        this.log.info("Brain", "OVERRIDE: no farm exists — running build_farm (self-sufficient)");
-        this.events.onThought("The fields call to me. Today the farm gets BUILT — no more excuses.");
-        const result = await executeAction(this.bot, "invoke_skill", { skill: "build_farm", ...FARM_SITE });
-        this.events.onAction("build_farm", result);
-        this.lastAction = "build_farm";
-        this.lastResult = result;
-        this.trackFailure(
-          "skill:build_farm",
-          { action: "build_farm", params: {} },
-          result,
-          /complete|harvest|planted/i.test(result),
-        );
-        return;
-      }
-    }
-
-    // Iron/strip-mine override — same deterministic pattern. The miner has
-    // strip_mine (staircases to Y=11, mines for ore) but the LLM won't pick it
-    // for the iron goal, so Forge mines surface dirt and the team never gets
-    // iron. When the miner has a pickaxe and no iron yet, run strip_mine. This
-    // both advances the iron-age goal AND generates the iron/ore trajectories
-    // the v2 dataset is starved of.
-    if (
-      config.bot.allowInterventions &&
-      this.roleConfig.allowedSkills.includes("strip_mine") &&
-      !isSkillRunning(this.bot)
-    ) {
-      const hasIron = this.bot.inventory
-        .items()
-        .some(
-          (i) =>
-            i.name === "iron_ingot" || i.name === "raw_iron" || (i.name.startsWith("iron_") && i.name !== "iron_ore"),
-        );
-      const hasPickaxe = this.bot.inventory.items().some((i) => i.name.endsWith("_pickaxe"));
-      const cooledDown = Date.now() - this.lastIronOverrideMs > 180_000;
-      if (!hasIron && hasPickaxe && cooledDown) {
-        this.lastIronOverrideMs = Date.now();
-        this.log.info("Brain", "OVERRIDE: no iron yet — running strip_mine for ore");
-        this.events.onThought("The deep calls. Time to carve for iron — pickaxe in hand, downward!");
-        const result = await executeAction(this.bot, "invoke_skill", { skill: "strip_mine" });
-        this.events.onAction("strip_mine", result);
-        this.lastAction = "strip_mine";
-        this.lastResult = result;
-        this.trackFailure(
-          "skill:strip_mine",
-          { action: "strip_mine", params: {} },
-          result,
-          /mined|ore|iron|complete/i.test(result),
-        );
-        return;
-      }
+    const actionOptions = this.currentActionMenu();
+    const hierarchySelection = actionOptions.some(
+      (option) =>
+        option.action === "choose_objective" ||
+        option.action === "choose_subobjective" ||
+        option.action === "leave_objective",
+    );
+    if (hierarchySelection) {
+      this.clearActiveGoal("the objective tree is awaiting a strategic selection");
     }
 
     const context = this.buildContext();
     const memoryCtx = this.memStore.getMemoryContext();
+    const queryMemoryCtx = hierarchySelection ? "" : memoryCtx;
     const role: RoleContext = {
       name: this.roleConfig.name,
       personality: this.roleConfig.personality,
@@ -827,25 +1468,33 @@ export class BotBrain {
       allowedActions: this.roleConfig.allowedActions,
       allowedSkills: this.roleConfig.allowedSkills,
       priorities: this.roleConfig.priorities,
+      actionOptions,
     };
 
-    const decision = await queryStrategic(context, this.recentHistory, memoryCtx, role);
-    await this.executeDecision(decision);
+    // Old action history is actively misleading while the model is choosing
+    // an objective level: it contains gather/craft/build calls that are
+    // intentionally unavailable here. Give this small choice a clean turn.
+    const decision = await queryStrategic(context, hierarchySelection ? [] : this.recentHistory, queryMemoryCtx, role);
+    await this.executeDecision(decision, "llm", actionOptions);
 
     // Capture the trajectory for fine-tuning: exact prompt -> decision -> outcome
     recordTrajectory({
       bot: this.roleConfig.name,
       system: buildStrategicPrompt(role),
-      context: memoryCtx ? `YOUR MEMORY:\n${memoryCtx}\n${context}` : context,
+      context: queryMemoryCtx ? `YOUR MEMORY:\n${queryMemoryCtx}\n${context}` : context,
       decision: { thought: decision.thought, action: decision.action, params: decision.params, goal: decision.goal },
       result: this.lastResult,
       success: this.lastActionWasSuccess,
+      executed: this.lastActionWasExecuted,
       timestamp: new Date().toISOString(),
     });
   }
 
   private async handleCritic(event: BrainEvent): Promise<void> {
     if (!this.CRITIC_ENABLED) return;
+    // The critic may evaluate ordinary LLM actions, but it must never turn
+    // into a second skill selector inside an active deterministic procedure.
+    if (this.objectiveTreeView().activeSubobjective) return;
     const { action, result, goal } = event.data ?? {};
     if (!action || !result) return;
 
@@ -865,7 +1514,8 @@ export class BotBrain {
       }`,
     ].join("\n");
 
-    const verdict = await queryCritic(this.roleConfig.name, criticContext, this.roleConfig.allowedActions);
+    const criticMenu = this.currentActionMenu();
+    const verdict = await queryCritic(this.roleConfig.name, criticContext, criticMenu);
 
     // Update thought display
     if (verdict.thought) {
@@ -873,19 +1523,21 @@ export class BotBrain {
     }
 
     if (verdict.goalComplete) {
-      this.log.info("Brain:critic", `Goal "${this.currentGoal}" complete. Re-planning.`);
-      this.currentGoal = "";
-      this.goalStepsLeft = 0;
+      this.clearActiveGoal("critic verified completion");
       // Trigger strategic re-plan after a brief pause
       setTimeout(() => this.triggerReplan(), 1000);
     } else if (verdict.nextAction && verdict.success) {
       // Critic suggests next step — execute directly without full LLM call
       this.log.debug("Brain:critic", `Next step: ${verdict.nextAction}`);
-      await this.executeDecision({
-        thought: verdict.thought,
-        action: verdict.nextAction,
-        params: verdict.nextParams,
-      });
+      await this.executeDecision(
+        {
+          thought: verdict.thought,
+          action: verdict.nextAction,
+          params: verdict.nextParams,
+        },
+        "llm",
+        criticMenu,
+      );
     } else if (!verdict.success) {
       // Action failed — trigger strategic re-plan
       this.log.info("Brain:critic", "Action failed. Re-planning.");
@@ -895,13 +1547,22 @@ export class BotBrain {
 
   // ─── Action execution ─────────────────────────────────────────────────────
 
-  private async executeDecision(decision: {
-    thought: string;
-    action: string;
-    params: Record<string, any>;
-    goal?: string;
-    goalSteps?: number;
-  }): Promise<void> {
+  private async executeDecision(
+    decision: {
+      thought: string;
+      action: string;
+      params: Record<string, any>;
+      goal?: string;
+      goalSteps?: number;
+    },
+    source: "llm" | "objective" = "llm",
+    advertisedMenu?: readonly ActionOption[],
+  ): Promise<void> {
+    // Only set true immediately before a validated Mineflayer execution.
+    // Strategic telemetry can then distinguish rejected/no-op proposals from
+    // real gameplay successes and failures.
+    this.lastActionWasExecuted = false;
+
     // Filter thought for safety
     const thoughtFilter = filterContent(decision.thought);
     if (!thoughtFilter.safe) {
@@ -952,44 +1613,100 @@ export class BotBrain {
       delete decision.params.skill;
     }
 
-    // ── Action gating ──
-    const UNIVERSAL_ACTIONS = new Set([
-      "give_item",
-      "idle",
-      "respond_to_chat",
-      "invoke_skill",
-      "deposit_stash",
-      "withdraw_stash",
-      "chat",
-      "generate_skill",
-      // Every bot must be able to MOVE and LOOK. Withholding "explore" from
-      // non-scout roles meant the farmer/builder/guard fired thousands of
-      // rejected look_around/scan/explore decisions (27% of Flora's actions
-      // overnight) — looking like they were "standing around" when they were
-      // actually stuck in a rejection loop. The alias family (scan,
-      // look_around, search...) already normalizes to explore in parseDecision.
-      "explore",
-    ]);
+    if (["choose_objective", "choose_subobjective", "leave_objective"].includes(decision.action)) {
+      this.handleObjectiveControlDecision(decision, advertisedMenu ?? this.currentActionMenu());
+      return;
+    }
+
     if (
-      this.roleConfig.allowedActions.length > 0 &&
-      !this.roleConfig.allowedActions.includes(decision.action) &&
-      !UNIVERSAL_ACTIONS.has(decision.action) &&
-      !this.roleConfig.allowedSkills.includes(decision.action)
+      source === "llm" &&
+      this.objectiveTreeView().activeSubobjective &&
+      !["eat", "flee", "attack", "neural_combat"].includes(decision.action)
     ) {
-      const gateMsg = `Action "${decision.action}" not allowed for ${this.roleConfig.name}. Use: ${this.roleConfig.allowedActions.join(", ")}`;
-      this.log.debug("Brain", `GATED: ${gateMsg}`);
-      this.events.onAction(decision.action, gateMsg);
-      this.lastResult = gateMsg;
-      // Blacklist it so the RECENTLY FAILED prompt section stops the bot from
-      // re-picking it — the fine-tuned model especially leaks other roles'
-      // actions (trained on all five bots' decisions mixed together).
-      this.blockAction(
+      this.rejectObjectiveControl(
         decision.action,
-        `Not in YOUR toolkit — use: ${this.roleConfig.allowedActions.join(", ")}`,
-        BotBrain.FAILURE_TTL_STRUCTURAL_MS,
+        "An active sub-objective owns its internal actions; only an immediate survival action may interrupt it.",
       );
       return;
     }
+
+    // Activate before execution so a newly proposed gather action can be
+    // checked against inventory immediately. Repeated copies of the same goal
+    // do not refresh its countdown.
+    this.activateGoal(decision.goal, decision.goalSteps);
+
+    // Never spend a pathfinding/action cycle gathering wood that this
+    // objective no longer needs. For a pure gather goal this also clears the
+    // goal; for a house/farm/tool project it retains the project and asks the
+    // planner to perform the actual build/craft or address a non-wood blocker.
+    if (decision.action === "gather_wood" && source === "llm") {
+      const goalForAssessment = this.currentGoal || "gather wood";
+      const assessment = assessWoodGatherDecision(goalForAssessment, inventoryCounts(this.bot.inventory.items()), {
+        nearbyCraftingTable: this.nearbyCraftingTable(),
+        woodTargetOverride: this.goalWoodTargetOverride,
+      });
+      if (assessment.goalComplete || assessment.wood?.satisfied) {
+        const msg = assessment.goalComplete
+          ? `Skipped gather_wood: ${assessment.goalCompleteReason ?? "the current goal is already complete"}. Choose a new objective.`
+          : `Skipped gather_wood: wood is already sufficient for ${assessment.wood?.purpose ?? "the current objective"}. Continue the actual objective or obtain its non-wood requirements.`;
+        this.log.info("Brain:goal", msg);
+        this.events.onAction("gather_wood", msg);
+        this.lastAction = "gather_wood";
+        this.lastResult = msg;
+        this.lastActionWasSuccess = true;
+        if (assessment.goalComplete) {
+          this.clearActiveGoal(assessment.goalCompleteReason ?? "wood target reached");
+        }
+        setTimeout(() => this.triggerReplan(), 250);
+        return;
+      }
+    }
+
+    // Small output goals are especially prone to inventory-blind repetition
+    // ("craft sticks" with ten stacks already held, or "craft torches" while
+    // carrying torches). Check the requested item itself even when the model
+    // attached the craft action to an unrelated high-level goal.
+    if (decision.action === "craft") {
+      const rawItem = String(decision.params?.item ?? (decision as Record<string, any>).item ?? "").toLowerCase();
+      if (rawItem === "stick" || rawItem === "torch") {
+        const rawCount = Number(decision.params?.count ?? (decision as Record<string, any>).count);
+        const impliedGoal = `craft ${Number.isFinite(rawCount) && rawCount > 0 ? `${rawCount} ` : ""}${rawItem}`;
+        const activeAssessment = this.currentGoal ? this.assessActiveGoal() : { goalComplete: false as const };
+        const itemAssessment =
+          activeAssessment.item?.item === rawItem
+            ? activeAssessment
+            : assessGoal(impliedGoal, inventoryCounts(this.bot.inventory.items()));
+        if (itemAssessment.item?.satisfied) {
+          const requirement = itemAssessment.item;
+          const msg = `Skipped craft ${rawItem}: already have ${requirement.current}/${requirement.target}. Continue the objective without making more.`;
+          this.log.info("Brain:goal", msg);
+          this.events.onAction("craft", msg);
+          this.lastAction = "craft";
+          this.lastResult = msg;
+          this.lastActionWasSuccess = true;
+          if (itemAssessment.goalComplete) {
+            this.clearActiveGoal(itemAssessment.goalCompleteReason ?? `${rawItem} target reached`);
+          }
+          setTimeout(() => this.triggerReplan(), 250);
+          return;
+        }
+        if (itemAssessment.item && itemAssessment.item.deficit > 0) {
+          // `craft` count means desired output items (the action converts that
+          // to recipe executions). Fill only the missing amount, rounded by
+          // Minecraft's recipe batch size inside craftItem.
+          decision.params = {
+            ...(decision.params ?? {}),
+            item: rawItem,
+            count: itemAssessment.item.deficit,
+          };
+        }
+      }
+    }
+
+    // Roles are behavioral guidance, not capability restrictions. Every bot
+    // may attempt every action implemented by executeAction and every skill in
+    // the shared registry. Unknown names flow through the executor, produce a
+    // normal classified failure, and are then suppressed by recentFailures.
 
     // ── Blacklist check ──
     this.purgeExpiredFailures();
@@ -998,7 +1715,9 @@ export class BotBrain {
       const blockMsg = `Blocked: "${actionKey}" recently failed. Try something else.`;
       this.log.debug("Brain", blockMsg);
       this.events.onAction(decision.action, blockMsg);
+      this.lastAction = decision.action;
       this.lastResult = blockMsg;
+      this.lastActionWasSuccess = false;
       // Trigger re-plan since this action was blocked
       setTimeout(() => this.triggerReplan(), 500);
       return;
@@ -1007,10 +1726,55 @@ export class BotBrain {
     // ── Normalize params ──
     const normalizedParams = { ...(decision.params ?? {}) };
     const rawDecision = decision as Record<string, any>;
-    for (const field of ["direction", "skill", "item", "block", "blockType", "count", "x", "y", "z", "message"]) {
+    for (const field of [
+      "direction",
+      "skill",
+      "item",
+      "block",
+      "blockType",
+      "count",
+      "x",
+      "y",
+      "z",
+      "message",
+      "objective",
+      "subobjective",
+      "reason",
+    ]) {
       if (rawDecision[field] !== undefined && normalizedParams[field] === undefined) {
         normalizedParams[field] = rawDecision[field];
       }
+    }
+
+    // The exact menu advertised to the model remains the authority for this
+    // decision. Rebuilding it here introduced a race: a teammate bulletin or
+    // live inventory observation could change the hierarchy between response
+    // generation and validation, rejecting a choice that was valid when shown.
+    // Recipe and coordinate validation still inspect the live bot state.
+    const executionMenu = advertisedMenu ?? this.currentActionMenu();
+    const validation = validateDecisionAgainstMenu(
+      this.bot,
+      { action: decision.action, params: normalizedParams },
+      executionMenu,
+    );
+    if (!validation.ok) {
+      const msg = `Rejected before execution: ${validation.reason}`;
+      this.log.info("Brain:gate", msg);
+      this.events.onAction(decision.action, msg);
+      this.lastAction = decision.action;
+      this.lastResult = msg;
+      this.lastActionWasSuccess = false;
+      if (
+        executionMenu.some((option) => option.action === "choose_objective" || option.action === "choose_subobjective")
+      ) {
+        this.clearActiveGoal("invalid legacy action proposed during hierarchical selection");
+      }
+      this.rememberHistory({
+        role: "assistant",
+        content: `My proposed ${decision.action} was rejected before execution: ${validation.reason}`,
+      });
+      setTimeout(() => this.triggerReplan(), 250);
+      return;
     }
 
     // Chat dedup — refuse to re-broadcast a near-identical message
@@ -1020,7 +1784,9 @@ export class BotBrain {
         const msg =
           "You already said that. Talking won't make it happen — ACT instead (check your inventory first; you may already have what you asked for).";
         this.events.onAction(decision.action, msg);
+        this.lastAction = decision.action;
         this.lastResult = msg;
+        this.lastActionWasSuccess = false;
         return;
       }
       this.lastChatSent = sig;
@@ -1038,20 +1804,60 @@ export class BotBrain {
       normalizedParams.protectPos = this.roleConfig.stashPos;
     }
 
-    // Inject the farm site (lake shore) into build_farm so the skill can
-    // travel to water instead of failing "no water within 96 blocks"
+    // Build only at a confirmed remembered shore. A base-coordinate fallback
+    // made an underground pool near the settlement masquerade as a farm site.
     const isBuildFarm =
       decision.action === "build_farm" ||
       (decision.action === "invoke_skill" && normalizedParams.skill === "build_farm");
     if (isBuildFarm && normalizedParams.x === undefined) {
-      normalizedParams.x = FARM_SITE.x;
-      normalizedParams.y = FARM_SITE.y;
-      normalizedParams.z = FARM_SITE.z;
+      const farmLocation = this.buildObjectiveSnapshot().farmLocation;
+      if (farmLocation) {
+        normalizedParams.x = farmLocation.x;
+        normalizedParams.y = farmLocation.y;
+        normalizedParams.z = farmLocation.z;
+      }
     }
-    // build_farm's bake step withdraws pooled wheat from the stash to bake a
-    // real bread batch (harvests are too small/scattered to bake individually).
+    // build_farm pools seeds before construction and wheat before baking.
     if (isBuildFarm && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
       normalizedParams.stashPos = this.roleConfig.stashPos;
+    }
+
+    const isMaintainFarm =
+      decision.action === "maintain_farm" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "maintain_farm");
+    if (isMaintainFarm && normalizedParams.farmLocation === undefined) {
+      const farmLocation = this.buildObjectiveSnapshot().farmLocation;
+      if (farmLocation) normalizedParams.farmLocation = farmLocation;
+    }
+    if (isMaintainFarm && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
+      normalizedParams.stashPos = this.roleConfig.stashPos;
+    }
+
+    const isLocateFarm =
+      decision.action === "locate_farm_site" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "locate_farm_site");
+    if (isLocateFarm && this.roleConfig.stashPos && normalizedParams.settlementAnchor === undefined) {
+      normalizedParams.settlementAnchor = this.roleConfig.stashPos;
+    }
+
+    const isSurveyRegion =
+      decision.action === "survey_region" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "survey_region");
+    if (isSurveyRegion && this.roleConfig.stashPos && normalizedParams.settlementAnchor === undefined) {
+      normalizedParams.settlementAnchor = this.roleConfig.stashPos;
+    }
+
+    const isAnimalPen =
+      decision.action === "establish_animal_pen" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "establish_animal_pen");
+    if (isAnimalPen) {
+      const snapshot = this.buildObjectiveSnapshot();
+      if (snapshot.farmLocation && normalizedParams.farmLocation === undefined) {
+        normalizedParams.farmLocation = snapshot.farmLocation;
+      }
+      if (this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
+        normalizedParams.stashPos = this.roleConfig.stashPos;
+      }
     }
 
     // Inject stash coordinates into setup_stash — the LLM invents garbage coords otherwise
@@ -1084,12 +1890,31 @@ export class BotBrain {
       normalizedParams.stashPos = this.roleConfig.stashPos;
     }
 
+    // Every miner returns to the same recorded entrance. The skill derives its
+    // actual site relative to this anchor and persists branch progress.
+    const isStripMine =
+      decision.action === "strip_mine" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "strip_mine");
+    if (isStripMine && this.roleConfig.stashPos && normalizedParams.settlementAnchor === undefined) {
+      normalizedParams.settlementAnchor = this.roleConfig.stashPos;
+    }
+
     // build_house pulls planks/logs from the stash so the builder isn't blocked
     // chopping a whole house's worth of wood from scratch.
     const isBuildHouse =
       decision.action === "build_house" ||
       (decision.action === "invoke_skill" && normalizedParams.skill === "build_house");
-    if (isBuildHouse && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
+    if (isBuildHouse && this.roleConfig.stashPos) {
+      if (normalizedParams.stashPos === undefined) normalizedParams.stashPos = this.roleConfig.stashPos;
+      if (normalizedParams.settlementAnchor === undefined) {
+        normalizedParams.settlementAnchor = this.roleConfig.stashPos;
+      }
+    }
+
+    const isBuildStructure =
+      decision.action === "build_structure" ||
+      (decision.action === "invoke_skill" && normalizedParams.skill === "build_structure");
+    if (isBuildStructure && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
       normalizedParams.stashPos = this.roleConfig.stashPos;
     }
 
@@ -1101,30 +1926,46 @@ export class BotBrain {
     if (isLightArea && this.roleConfig.stashPos && normalizedParams.stashPos === undefined) {
       normalizedParams.stashPos = this.roleConfig.stashPos;
     }
+    if (isLightArea && normalizedParams.x === undefined) {
+      const snapshot = this.buildObjectiveSnapshot();
+      const zone = String(normalizedParams.safetyZone ?? "");
+      const target =
+        zone === "lodge"
+          ? snapshot.houseLocation
+          : zone === "farm"
+            ? snapshot.farmLocation
+            : zone === "mine"
+              ? snapshot.mineLocation
+              : this.roleConfig.stashPos;
+      if (target) {
+        normalizedParams.x = target.x;
+        normalizedParams.y = target.y;
+        normalizedParams.z = target.z;
+      }
+    }
 
     // ── Execute ──
-    const result = await executeAction(this.bot, decision.action, normalizedParams);
+    this.lastActionWasExecuted = true;
+    this.publishBulletin(decision.action, decision.thought, "In progress...");
+    const bulletinHeartbeat = setInterval(
+      () => this.publishBulletin(decision.action, decision.thought, "Still in progress..."),
+      10_000,
+    );
+    bulletinHeartbeat.unref?.();
+    let result: string;
+    const inventoryBefore = this.inventoryRecord(this.bot.inventory.items());
+    try {
+      result = await executeAction(this.bot, decision.action, normalizedParams);
+    } finally {
+      clearInterval(bulletinHeartbeat);
+    }
     this.lastAction = decision.action;
     this.lastResult = result;
     this.events.onAction(decision.action, result);
     this.log.info("Brain", `Result: ${result}`);
 
-    // Update team bulletin
-    updateBulletin({
-      name: this.roleConfig.name,
-      action: decision.action,
-      position: {
-        x: this.bot.entity.position.x,
-        y: this.bot.entity.position.y,
-        z: this.bot.entity.position.z,
-      },
-      thought: decision.thought,
-      health: this.bot.health,
-      food: this.bot.food,
-      timestamp: Date.now(),
-      goal: this.currentGoal || decision.goal,
-      lastResult: result.slice(0, 120),
-    });
+    // Update team bulletin, including the persistent objective commitment.
+    this.publishBulletin(decision.action, decision.thought, result);
 
     // Update overlay with result
     updateOverlay({
@@ -1140,18 +1981,19 @@ export class BotBrain {
       inventory: this.bot.inventory.items().map((i) => `${i.name}x${i.count}`),
     });
 
-    // ── Track goal ──
-    if (decision.goal) {
-      this.currentGoal = decision.goal;
-      this.goalStepsLeft = decision.goalSteps || 5;
-    }
-
     // ── Scoreboard ──
     // (isSuccess computed below — record after it)
-    const isSuccess =
-      /complet|harvest|built|planted|smelted|crafted|arriv|gather|mined|caught|lit|bridg|chop|killed|ate|explored|placed|fished|sleep|zzz/i.test(
-        result,
+    const isSuccess = actionResultSucceeded(result);
+    if (isSuccess && ["deposit_stash", "withdraw_stash"].includes(decision.action)) {
+      const inventoryAfter = this.inventoryRecord(this.bot.inventory.items());
+      const changed = Object.keys({ ...inventoryBefore, ...inventoryAfter }).some((name) =>
+        decision.action === "deposit_stash"
+          ? (inventoryAfter[name] ?? 0) < (inventoryBefore[name] ?? 0)
+          : (inventoryAfter[name] ?? 0) > (inventoryBefore[name] ?? 0),
       );
+      if (changed)
+        this.memStore.recordProgressionStorage(decision.action === "deposit_stash" ? "deposited" : "retrieved");
+    }
     this.lastActionWasSuccess = isSuccess;
     recordAction(this.roleConfig.name, decision.action, result, isSuccess);
     if (decision.action === "invoke_skill" || skillRegistry.has(decision.action)) {
@@ -1189,25 +2031,87 @@ export class BotBrain {
     // Failure tracking
     this.trackFailure(actionKey, decision, result, isSuccess);
 
-    // Track goal steps
-    if (isSuccess && this.goalStepsLeft > 0) {
-      this.goalStepsLeft--;
+    // Legacy free-text goals remain available only outside the hierarchical
+    // objective executor. Persistent projects use observed completion evidence
+    // from objectiveTreeView instead of a model-authored step countdown.
+    // If the overall project is not complete, attempted non-trivial actions
+    // consume its finite step budget. Counting failures too prevents an
+    // impossible or badly phrased goal from persisting forever. A later goal
+    // can independently request wood again
+    // because every assessment uses the live inventory rather than a flag.
+    if (source === "llm") {
+      const partialHouse = result.match(/\bHouse partially built \((\d+)\/(\d+) blocks\)/i);
+      if (
+        partialHouse &&
+        /\b(build|finish|complete|repair)\b/i.test(this.currentGoal) &&
+        /\b(house|home|shelter)\b/i.test(this.currentGoal)
+      ) {
+        const placed = Number(partialHouse[1]);
+        // Up to eight reported placements may be doors/table/torches rather
+        // than plank blocks. Discount them before reducing the target so the
+        // estimate cannot leave a resumed build short.
+        const definitelyPlacedPlanks = Math.max(0, placed - 8);
+        this.goalWoodTargetOverride = Math.max(0, HOUSE_WOOD_TARGET - definitelyPlacedPlanks);
+      }
+      const goalAssessment = this.reconcileActiveGoal(decision.action, result);
+      if (goalAssessment.goalComplete) {
+        setTimeout(() => this.triggerReplan(), 250);
+      } else if (this.goalStepsLeft > 0 && !["idle", "chat", "respond_to_chat"].includes(decision.action)) {
+        this.goalStepsLeft--;
+        if (this.goalStepsLeft <= 0) {
+          this.clearActiveGoal("step budget exhausted before proven completion");
+          setTimeout(() => this.triggerReplan(), 250);
+        }
+      }
     }
 
     // Lock home position when first house built
     if (isSuccess && decision.action === "build_house" && !this.homePos) {
-      const p = this.bot.entity.position;
+      const p = this.roleConfig.stashPos ?? this.bot.entity.position;
       this.homePos = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
       this.log.debug("Brain", `Home locked at ${this.homePos.x}, ${this.homePos.y}, ${this.homePos.z}`);
     }
 
     // Track history
-    this.recentHistory.push({
+    this.rememberHistory({
       role: "assistant",
-      content: `I decided to ${decision.action}: ${decision.thought}. Result: ${result}`,
+      content:
+        source === "objective"
+          ? `My selected sub-objective automatically ran ${decision.action}. Result: ${result}`
+          : `I decided to ${decision.action}: ${decision.thought}. Result: ${result}`,
     });
-    if (this.recentHistory.length > 12) {
-      this.recentHistory.splice(0, this.recentHistory.length - 8);
+
+    if (source === "objective") {
+      const active = this.memStore.getObjectiveCommitment();
+      const subobjectiveId = active?.subobjectiveId;
+      if (!isSuccess && subobjectiveId) {
+        this.objectiveAutoFailures++;
+        const missingPrecondition =
+          /missing:|need \d|no (?:trees|water|seeds|food|hoe|torches?|fuel|coal|iron|pickaxe|furnace)|can't craft|not enough|could not find|no executable|terrain/i.test(
+            result,
+          );
+        // A prerequisite miss gets one immediate reconciliation pass. Chunk
+        // observations, collected drops, and stash summaries often land just
+        // after the action result; abandoning on the first miss discarded a
+        // viable work order before the new state became visible. The resolver
+        // will select withdraw/craft/mine on the next pass when appropriate.
+        const failureLimit = missingPrecondition ? 3 : 2;
+        if (this.objectiveAutoFailures >= failureLimit) {
+          this.deferActiveSubobjective(subobjectiveId, result.slice(0, 160), missingPrecondition ? 60_000 : 120_000);
+          return;
+        }
+      } else if (isSuccess && ["expand_stash", "light_settlement"].includes(subobjectiveId ?? "")) {
+        // These one-shot maintenance operations may not immediately update a
+        // remotely observed capacity/light fact, but one successful run has
+        // completed the selected task.
+        this.memStore.clearObjectiveSubobjective();
+      } else {
+        this.objectiveAutoFailures = 0;
+        this.resetObjectiveRecovery();
+        this.objectiveTreeView(); // reconcile live completion evidence
+      }
+      this.scheduleHierarchicalContinuation();
+      return;
     }
 
     // ── Trigger critic ──
@@ -1288,7 +2192,7 @@ export class BotBrain {
       if (!isSuccess) {
         const isAlreadyRunning = result.startsWith("Already running skill");
         const isPreconditionFailure =
-          /missing:|need \d|no water|no trees|no coal|no iron|no pickaxe|Can't craft|could not find|not enough|need to (mine|craft|find|smelt)|Can't sleep|terrain too rough|not nighttime|already sleeping|zzz/i.test(
+          /missing:|need \d|no water|no (?:reachable|usable) (?:surface water|farm shore)|farm shore|remembered farm shore|no seeds|no trees|no coal|no iron|no pickaxe|Can't craft|could not find|not enough|need to (mine|craft|find|smelt)|Can't sleep|terrain too rough|not nighttime|already sleeping|zzz/i.test(
             result,
           );
 

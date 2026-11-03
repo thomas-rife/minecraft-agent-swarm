@@ -80,6 +80,9 @@
     <iframe id="viewerFrame" src="about:blank"></iframe>
   </div>
   <div class="sidebar">
+    <h3>TEAM PROGRESSION</h3>
+    <div id="progression" aria-live="polite" style="font-size:12px;line-height:1.5;white-space:pre-line">Waiting for team state...</div>
+    <p style="font-size:11px;color:#999">Existing skills execute milestones. Nether procedures are still planned.</p>
     <h3>STASH STATUS</h3>
     <div class="stash-row"><span class="stash-label">Bldg</span><span class="stash-val" id="stash-building">--</span></div>
     <div class="stash-row"><span class="stash-label">Metal</span><span class="stash-val" id="stash-metal">--</span></div>
@@ -114,6 +117,18 @@ function esc(str) {
 
 async function init() {
   try {
+    async function pollProgression() {
+      try {
+        var r = await fetch('/api/progression');
+        var stages = await r.json();
+        document.getElementById('progression').textContent = stages.map(function(stage) {
+          var text = stage.label + ': ' + stage.status + ' (' + (stage.objectives.length - stage.remainingObjectives.length) + '/' + stage.objectives.length + ')';
+          if (stage.status === 'available') text += '\n' + stage.remainingObjectives.map(function(objective) { return '  · ' + objective.goal; }).join('\n');
+          return text;
+        }).join('\n');
+      } catch (e) { /* dashboard may outlive bot process */ }
+    }
+    pollProgression(); setInterval(pollProgression, 5000);
     async function pollStash() {
       try {
         var r = await fetch('/api/stash');

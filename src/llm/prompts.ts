@@ -9,9 +9,7 @@
  * - Chat (~200 tokens)       — respond to players, uses fast model
  */
 
-import { getSkillPromptLines } from "../skills/registry.js";
-import { getDynamicSkillNames } from "../skills/dynamic-loader.js";
-import { rankSkills, annotateSkill } from "../skills/reliability.js";
+import { ACTION_SIGNATURES, renderActionMenu, type ActionOption } from "../bot/action-menu.js";
 
 export interface RoleContext {
   name: string;
@@ -21,35 +19,14 @@ export interface RoleContext {
   allowedActions?: string[];
   allowedSkills?: string[];
   priorities?: string;
+  /** Deterministically filtered live action/skill menu for this decision. */
+  actionOptions?: ActionOption[];
 }
 
 /**
  * Strategic prompt — goal-setting and planning decisions.
  * Used with the strong model (32b). Called every ~10s or on goal complete/fail.
  */
-/** Compact param signatures — shown next to each action so the LLM sends usable params. */
-const ACTION_SIGNATURES: Record<string, string> = {
-  gather_wood: 'gather_wood {"count":5}',
-  mine_block: 'mine_block {"blockType":"iron_ore"}',
-  go_to: 'go_to {"x":0,"y":64,"z":0}',
-  explore: 'explore {"direction":"north"}',
-  craft: 'craft {"item":"oak_planks","count":4}',
-  eat: "eat {}",
-  attack: "attack {}",
-  flee: "flee {}",
-  place_block: 'place_block {"blockType":"oak_planks"}',
-  sleep: "sleep {}",
-  idle: "idle {}",
-  chat: 'chat {"message":"..."}',
-  respond_to_chat: 'respond_to_chat {"message":"..."}',
-  invoke_skill: 'invoke_skill {"skill":"exact_skill_name"}',
-  generate_skill: 'generate_skill {"task":"description"}',
-  neural_combat: 'neural_combat {"duration":5}',
-  give_item: 'give_item {"to":"Flora","item":"oak_log","count":8}',
-  deposit_stash: "deposit_stash {}",
-  withdraw_stash: 'withdraw_stash {"item":"oak_log","count":8}',
-};
-
 function renderActions(names: string[]): string {
   return names.map((a) => ACTION_SIGNATURES[a] ?? a).join(", ");
 }
@@ -57,67 +34,70 @@ function renderActions(names: string[]): string {
 export function buildStrategicPrompt(role: RoleContext): string {
   const name = role.name;
 
-  // Build action list — role-specific if configured, otherwise full list
-  const universalNames = [
-    "explore",
-    "idle",
-    "respond_to_chat",
-    "invoke_skill",
-    "give_item",
-    "deposit_stash",
-    "withdraw_stash",
-  ];
-  const actions = role.allowedActions?.length
-    ? renderActions([...role.allowedActions, ...universalNames.filter((u) => !role.allowedActions!.includes(u))])
-    : renderActions(Object.keys(ACTION_SIGNATURES));
+  // Production callers supply a deterministic menu derived from live world
+  // state. The role list remains a safe legacy fallback for prompt-only tests.
+  const actionOptions = role.actionOptions ?? [];
+  const actions =
+    actionOptions.length > 0
+      ? renderActionMenu(actionOptions)
+      : renderActions(role.allowedActions?.length ? role.allowedActions : ["explore", "go_to", "idle"]);
+  const preferredActions = role.allowedActions?.length ? role.allowedActions.join(", ") : "";
 
-  // Skills list
   const builtinSkills = role.allowedSkills?.length ? role.allowedSkills.join(", ") : "";
-  const skillLines = !role.allowedSkills?.length ? getSkillPromptLines() : "";
-
-  // Ranked by team-wide success rate: proven first, untried next (exploration),
-  // strugglers last, retired skills excluded entirely.
-  const dynamicSkills = rankSkills(getDynamicSkillNames());
-  const dynamicLine =
-    dynamicSkills.length > 0
-      ? `\nDynamic skills (use invoke_skill; % = team success rate): ${dynamicSkills
-          .slice(0, 10)
-          .map(annotateSkill)
-          .join(", ")}${dynamicSkills.length > 10 ? ` (+${dynamicSkills.length - 10} more)` : ""}`
-      : "";
+  const hierarchySelection = actionOptions.some(
+    (option) =>
+      option.action === "choose_objective" ||
+      option.action === "choose_subobjective" ||
+      option.action === "leave_objective",
+  );
+  const hierarchyOptions = actionOptions.filter(
+    (option) =>
+      option.action === "choose_objective" ||
+      option.action === "choose_subobjective" ||
+      option.action === "leave_objective",
+  );
+  const hierarchyExample = hierarchyOptions[0];
 
   const missionLine = role.seasonGoal
     ? `🎯 MISSION: ${role.seasonGoal}\nEvery decision should advance this mission.\n\n`
     : "";
 
+  if (hierarchySelection) {
+    return `${missionLine}You are ${name}, an AI playing Minecraft.
+${role.personality}
+${role.role ? `ROLE: ${role.role}\n` : ""}
+
+You are at a STRATEGIC SELECTION level. Choose exactly one entry from
+AVAILABLE NOW. Do not choose a Minecraft action or skill—the controller will
+execute those automatically after you choose a sub-objective.
+
+AVAILABLE NOW:
+${renderActionMenu(hierarchyOptions)}
+
+Return exactly one JSON object using the action and parameter names shown
+above. Copy one allowed objective/sub-objective ID exactly. Do not add a goal,
+goalSteps, coordinates, item, skill, or extra action.
+
+RESPONSE:
+{"thought":"Brief reason under 120 characters","action":"${hierarchyExample?.action ?? "choose_objective"}","params":${hierarchyExample?.signature.match(/\{.*\}$/)?.[0] ?? '{"objective":"exact_allowed_id"}'}}
+`;
+  }
+
   return `${missionLine}You are ${name}, an AI playing Minecraft on a livestream. Chat controls you.
 ${role.personality}
 
-${role.role ? `ROLE: ${role.role}\n` : ""}ACTIONS: ${actions}
-${builtinSkills ? `SKILLS: ${builtinSkills}` : ""}
-${skillLines}${dynamicLine}
+${role.role ? `ROLE: ${role.role}\n` : ""}AVAILABLE NOW — choose EXACTLY one entry; anything else will be rejected:
+${actions}
+${preferredActions ? `ROLE-PREFERRED ACTIONS (guidance only): ${preferredActions}` : ""}
+${builtinSkills ? `ROLE SPECIALTIES (they appear above only when currently relevant): ${builtinSkills}` : ""}
 
 ${role.priorities || ""}
 
 CRAFTING BASICS:
 - Logs → planks (1 log = 4 planks). Planks → sticks (2 planks = 4 sticks).
-- 3 planks + 2 sticks → wooden_pickaxe. 2 planks → crafting_table.
+- 3 planks + 2 sticks → wooden_pickaxe. 4 planks → crafting_table.
 - Wool from killing sheep (0-2 per sheep). 3 wool + 3 planks → bed.
 - Use exact Minecraft IDs: oak_planks, stick, wooden_pickaxe, etc.
-
-IRON PATH (the goal — don't mine plain stone when you want iron):
-- When you SPOT iron_ore, mine it: mine_block {"blockType":"iron_ore"} (it walks
-  to the ore and mines the whole vein). A stone pickaxe or better is required.
-- Then smelt it: invoke_skill {"skill":"smelt_ores"} → iron_ingot (needs a
-  furnace + fuel like coal/planks; the skill builds the furnace from cobblestone).
-- Then upgrade gear: invoke_skill {"skill":"craft_gear"}.
-- No ore in sight? invoke_skill {"skill":"strip_mine"} digs down to Y=11 and mines.
-
-FOOD / DON'T STARVE:
-- If hunger is low: eat {} (eats the best food you have, including raw meat).
-- NO food in inventory? attack {} — when no monster is near it HUNTS the nearest
-  animal (cow/pig/sheep/chicken) and collects the meat. Then eat {}. Hunt BEFORE
-  you starve, not at 0 hunger.
 
 RULES:
 - Respond ONLY with valid JSON. Keep "thought" under 120 chars — shown on stream.
@@ -126,14 +106,32 @@ RULES:
   trees, or surroundings that aren't listed in your context. Flavor the words,
   never the facts: if the state says daytime and no threats, you are safe.
 - READ your inventory before choosing. Don't craft without materials.
+- Obey the deterministic WOOD REQUIREMENT in the state. It is specific to the
+  current objective. Once it says satisfied, STOP gathering wood and craft/build;
+  a later objective will calculate a new deficit if more wood is needed.
+- Finished outputs beat ingredients: if you already have the requested tool, or
+  the state says a table/farm/house exists, move on even if raw wood is low.
+- Obey STICK REQUIREMENT and TORCH REQUIREMENT exactly. Existing stacks count;
+  never craft or withdraw more after the requirement says satisfied.
+- Never invent an action or skill. Use an exact action/signature from AVAILABLE NOW.
+- If an action or skill is absent from AVAILABLE NOW, its target, prerequisites,
+  or situational reason is not currently present. Choose a listed alternative.
+- Decision making is hierarchical. When AVAILABLE NOW contains choose_objective,
+  select the high-level project that best fits world needs and your role. When it
+  contains choose_subobjective, select the approach/phase you want to pursue.
+- After you choose a sub-objective, Mineflayer executes its required skills
+  automatically. You do NOT choose its internal skills. You are consulted again
+  only when that procedure completes, blocks, or needs a new strategic choice.
+- A persistent ACTIVE PROJECT outranks an improvised goal sentence. Do not rename
+  the project through "goal"; explicitly leave it only when reprioritization is justified.
 - If an action failed recently, try something COMPLETELY DIFFERENT.
 - FOCUS: Finish one goal before starting another. Plan 3-5 steps ahead.
-- PREFER SKILLS over manual actions when available.
-- RESOURCE SHARING — USE THE STASH, NOT CHAT: The Stash is the team's shared
-  warehouse. If you NEED an item, withdraw_stash it. If you have SURPLUS,
-  deposit_stash it. NEVER beg teammates in chat for items and never wait for
-  a hand-off — that wastes everyone's time. Producers deposit, consumers
-  withdraw. give_item is only for emergencies when the stash is empty.
+- PREFER a listed skill over manual actions when it advances the goal.
+- Roles guide priorities, not permanent permissions. A non-specialty skill will
+  appear in AVAILABLE NOW when the active goal genuinely matches it.
+- RESOURCE SHARING — USE THE STASH, NOT CHAT: when withdraw_stash or
+  deposit_stash appears in AVAILABLE NOW, prefer it over begging teammates.
+  Never invent a stash action when it is absent.
 
 RESPONSE FORMAT:
 {"thought":"Brief entertaining narration","action":"action_name","params":{...},"goal":"Current objective","goalSteps":5}
@@ -147,8 +145,8 @@ Set "goal" when starting something new. Omit when continuing.
  * Used with fast model (8b). Called on hostile spotted, damage taken, low health.
  * Deliberately tiny (~300 tokens) so the 8b model can handle it reliably.
  */
-export function buildReactivePrompt(name: string, allowedActions?: string[]): string {
-  // Build action descriptions from what this bot is allowed to do
+export function buildReactivePrompt(name: string, actionOptions?: ActionOption[]): string {
+  // Survival capabilities are shared: any bot must be able to defend itself.
   const actionDescriptions: Record<string, string> = {
     attack: "attack: Melee attack nearest mob",
     flee: "flee: Run away from danger",
@@ -157,14 +155,12 @@ export function buildReactivePrompt(name: string, allowedActions?: string[]): st
     go_to: "go_to: Move to a location",
     idle: "idle: Wait and reassess",
   };
-  const reactiveRelevant = ["attack", "flee", "eat", "neural_combat", "idle"];
-  const available = (
-    allowedActions?.length
-      ? reactiveRelevant.filter((a) => allowedActions.includes(a) || a === "idle")
-      : reactiveRelevant
-  )
-    .map((a) => `- ${actionDescriptions[a] || a}`)
-    .join("\n");
+  const reactiveRelevant = new Set(["attack", "flee", "eat", "neural_combat", "explore", "idle"]);
+  const filtered = actionOptions?.filter((option) => reactiveRelevant.has(option.action)) ?? [];
+  const available =
+    filtered.length > 0
+      ? renderActionMenu(filtered)
+      : ["flee", "explore", "idle"].map((action) => `- ${actionDescriptions[action] || action}`).join("\n");
 
   return `You are ${name} in Minecraft. QUICK DECISION — react to the situation below.
 
@@ -181,10 +177,11 @@ ${available}
  * Used with fast model (8b). Called after every action completes.
  * Determines if we should continue the current goal or re-plan.
  */
-export function buildCriticPrompt(name: string, allowedActions?: string[]): string {
-  const actionLine = allowedActions?.length
-    ? `\nAVAILABLE ACTIONS: ${allowedActions.join(", ")}, idle\nOnly suggest actions from this list.`
-    : "";
+export function buildCriticPrompt(name: string, actionOptions?: ActionOption[]): string {
+  const menu = actionOptions?.length ? renderActionMenu(actionOptions) : renderActions(["explore", "go_to", "idle"]);
+  const actionLine = `\nAVAILABLE NOW — nextAction must be an exact action from one entry:
+${menu}
+Do not invent an action or skill. If none advances the goal, complete/replan it.`;
 
   return `You are ${name}'s inner critic. Evaluate the last action and decide what's next.
 
