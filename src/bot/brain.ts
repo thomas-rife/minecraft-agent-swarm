@@ -25,8 +25,7 @@ import type { RoleContext } from "../llm/prompts.js";
 import { getWorldContext, isHostile } from "./perception.js";
 import { executeAction } from "./actions.js";
 import { digOutIfStuck, escapeWaterIfDrowning } from "./navigation.js";
-import { updateOverlay, addChatMessage, speakThought, setCurrentBot } from "../stream/overlay.js";
-import { generateSpeech } from "../stream/tts.js";
+import { updateOverlay, addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { filterContent, filterChatMessage, filterViewerMessage } from "../safety/filter.js";
 import { abortActiveSkill, isSkillRunning, getActiveSkillName } from "../skills/executor.js";
 import { skillRegistry } from "../skills/registry.js";
@@ -350,6 +349,16 @@ export class BotBrain {
 
     // 3. Health/hunger monitoring via mineflayer events
     this.bot.on("health", () => this.checkVitals());
+
+    // Recheck live supplies after respawn while retaining world progress and intent.
+    this.bot.on("respawn", () => {
+      this.resetObjectiveRecovery();
+      this.objectiveAutoSteps = 0;
+      this.objectiveAutoFailures = 0;
+      this.recentFailures.clear();
+      this.failureCounts.clear();
+      this.scheduleHierarchicalContinuation(1500);
+    });
 
     // 4. Entity hurt — react when bot takes damage
     this.bot.on("entityHurt", (entity: Entity) => {
@@ -905,8 +914,8 @@ export class BotBrain {
     this.purgeExpiredFailures();
     const stores = [...new Set([this.memStore, ...getAllMemoryStores()])];
     const previous = { completedObjectives: [...new Set(stores.flatMap((store) => store.getProgressionObjectives()))] };
-    const anchor = this.roleConfig.stashPos ?? this.homePos;
-    const state = anchor ? reconcileProgression(previous, observeProgression(this.bot, anchor)) : previous;
+    const anchor = this.roleConfig.stashPos ?? this.homePos ?? this.bot.entity.position;
+    const state = reconcileProgression(previous, observeProgression(this.bot, anchor));
     const newlyVerified = state.completedObjectives.filter((id) => !previous.completedObjectives.includes(id));
     for (const store of stores) store.saveProgressionObjectives(state.completedObjectives);
     if (newlyVerified.length) {
@@ -1598,12 +1607,7 @@ export class BotBrain {
       inventory: this.bot.inventory.items().map((i) => `${i.name}x${i.count}`),
     });
 
-    // TTS in background
-    generateSpeech(decision.thought)
-      .then((url) => {
-        if (url) speakThought(url);
-      })
-      .catch(() => {});
+    // Speech narration disabled; thoughts remain visible in the overlay and logs.
 
     // Unwrap invoke_skill aliasing a built-in action (e.g. {"skill":"deposit_stash"})
     // so gating and param injection below see the real action.
@@ -1791,6 +1795,10 @@ export class BotBrain {
       }
       this.lastChatSent = sig;
       this.lastChatSentMs = Date.now();
+    }
+
+    if (decision.action === "gather_wood" && this.roleConfig.stashPos) {
+      normalizedParams.settlementAnchor = this.roleConfig.stashPos;
     }
 
     // Inject stash config

@@ -21,6 +21,7 @@ import { isNeuralServerRunning } from "../neural/bridge.js";
 import { BotBrain, type ChatMessage, type BrainEvents } from "./brain.js";
 import { recordDeath, startScoreboard } from "./scoreboard.js";
 import { registerDiagnosticBot } from "../diagnostics/memory-monitor.js";
+import { installLiquidAvoidance } from "./movement-policy.js";
 
 // Re-export types used by src/index.ts
 export type { ChatMessage, BrainEvents as BotEvents };
@@ -71,6 +72,7 @@ export async function createBot(events: BrainEvents, roleConfig: BotRoleConfig =
 
   // Load plugins
   bot.loadPlugin(pathfinder);
+  bot.loadPlugin(installLiquidAvoidance);
   bot.loadPlugin(customPvp);
   bot.loadPlugin(autoEat);
 

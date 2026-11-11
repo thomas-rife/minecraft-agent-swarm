@@ -1,10 +1,12 @@
 node_modules/
+.DS_Store
 dist/
 .env
 server/
 *.jar
 logs/
 memory.json
+memory-backups/
 firebase-debug.log
 
 skills/generated/*.js

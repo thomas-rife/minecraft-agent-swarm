@@ -80,12 +80,12 @@ export function safeMoves(bot: Bot): InstanceType<typeof Movements> {
   return moves;
 }
 
-/** Movement config for exploring — allows swimming across water (allowFreeMotion=true) */
+/** Movement config for exploring on dry paths. */
 export function explorerMoves(bot: Bot): InstanceType<typeof Movements> {
   const moves = new Movements(bot);
   moves.canDig = false;
   moves.allow1by1towers = false;
-  moves.allowFreeMotion = true; // needed for pathfinder to route through water
+  moves.allowFreeMotion = false;
   moves.scafoldingBlocks = [];
   // Fall safety: Atlas the explorer was 25 of 31 fall deaths over the week,
   // roaming off cliffs/ledges. Cap how far the pathfinder will drop (default

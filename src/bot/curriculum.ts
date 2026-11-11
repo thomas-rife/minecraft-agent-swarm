@@ -9,7 +9,6 @@
  */
 
 import type { Bot } from "mineflayer";
-import { FARM_SITE } from "./role.js";
 
 interface TechStage {
   name: string;
@@ -108,7 +107,7 @@ const FARM_LADDER: TechStage[] = [
   {
     name: "the farm",
     reached: () => false, // completion is recorded by the skill itself; keep pushing
-    suggestion: `go_to the shared farm search area at (${FARM_SITE.x}, ${FARM_SITE.y}, ${FARM_SITE.z}), then invoke_skill build_farm`,
+    suggestion: "invoke_skill locate_farm_site to discover nearby water and suitable ground, then invoke_skill build_farm",
   },
 ];
 

@@ -1009,17 +1009,6 @@ function goToFarm(snapshot: ObjectiveSnapshot): ActionOption | undefined {
   };
 }
 
-function goToSettlement(snapshot: ObjectiveSnapshot): ActionOption | undefined {
-  const target = snapshot.settlementAnchor;
-  if (!target) return undefined;
-  return {
-    action: "go_to",
-    signature: `go_to ${JSON.stringify(target)}`,
-    description: `Return to the settlement at (${target.x},${target.y},${target.z}).`,
-    coordinateTargets: [{ ...target, label: "settlement" }],
-  };
-}
-
 function invokeSkill(
   snapshot: ObjectiveSnapshot,
   skill: string,
@@ -1049,7 +1038,14 @@ function craftItem(item: string, count: number, description: string): ActionOpti
 }
 
 function gatherWood(snapshot: ObjectiveSnapshot, woodTarget: number, description: string): ActionOption | undefined {
-  if (!snapshot.visibleTrees || snapshot.recentlyFailed.has("gather_wood")) return undefined;
+  if (!snapshot.visibleTrees || snapshot.recentlyFailed.has("gather_wood")) {
+    if (snapshot.recentlyFailed.has("explore")) return undefined;
+    return {
+      action: "explore",
+      signature: 'explore {}',
+      description: "Search for reachable trees to replace missing supplies, then resume the active objective.",
+    };
+  }
   const count = Math.max(1, Math.ceil((woodTarget - carriedWood(snapshot)) / 4));
   return {
     action: "gather_wood",
@@ -1099,9 +1095,11 @@ function miningProcedure(
     if (stored.length > 0) {
       return [withdrawItems(snapshot, stored, "Withdraw a pickaxe before returning to the shared mine.", 1)];
     }
-    return compact([
-      invokeSkill(snapshot, "craft_gear", "Craft the working pickaxe required by the mining procedure."),
-    ]);
+    return (
+      ensurePortableCrafting(snapshot, 8, "Prepare supplies for a replacement mining pickaxe.") ?? [
+        craftItem("wooden_pickaxe", 1, "Replace the missing pickaxe before resuming mining."),
+      ]
+    );
   }
   return compact([
     invokeSkill(snapshot, "strip_mine", description, {
@@ -1367,15 +1365,6 @@ function leafOptions(view: ObjectiveTreeView, baseOptions: readonly ActionOption
       case "crafting_station": {
         const preparation = ensurePortableCrafting(snapshot, 8, "Prepare a crafting station near the base.");
         if (preparation) return preparation;
-        if (
-          snapshot.position &&
-          snapshot.settlementAnchor &&
-          Math.hypot(
-            snapshot.position.x - snapshot.settlementAnchor.x,
-            snapshot.position.z - snapshot.settlementAnchor.z,
-          ) > 16
-        )
-          return compact([goToSettlement(snapshot)]);
         return [
           {
             action: "place_block",

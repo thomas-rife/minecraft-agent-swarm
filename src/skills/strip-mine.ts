@@ -21,12 +21,12 @@ const TORCH_INTERVAL = 6;
 // deep. Y=16 restores iron supply, still yields coal/copper, and is well above
 // the lava lakes (~-50) so it stays lava-safe.
 const TARGET_Y = 16;
-const COAL_TARGET_Y = 48;
+const STARTER_RESOURCE_Y = 48;
 
 export const stripMineSkill: Skill = {
   name: "strip_mine",
   description:
-    "Use the settlement's shared mine entrance and extend a persistent lit branch at the appropriate resource level (Y=16 for iron/general, Y=48 for coal). Can target iron, coal, stone, or general resources. Requires a pickaxe.",
+    "Use the settlement's shared mine entrance and extend a persistent lit branch at the appropriate resource level (Y=48 for stone, iron, and coal; Y=16 for general mining). Requires a pickaxe.",
   params: {
     target: {
       type: "string",
@@ -51,7 +51,7 @@ export const stripMineSkill: Skill = {
 
     const target = normalizeTarget(params?.target);
     const targetCount = Math.max(1, Math.min(64, Number(params?.targetCount) || 64));
-    const targetY = target === "coal" ? COAL_TARGET_Y : TARGET_Y;
+    const targetY = ["stone", "iron", "coal"].includes(target) ? STARTER_RESOURCE_Y : TARGET_Y;
     const settlementAnchor = params?.settlementAnchor as { x: number; y: number; z: number } | undefined;
     const sharedMine = await reachSharedMine(bot, settlementAnchor, signal, onProgress);
     if (!sharedMine.success) return { success: false, message: sharedMine.message };
@@ -70,8 +70,7 @@ export const stripMineSkill: Skill = {
       `[Skill] Shared mine run ${runIndex + 1}: target=${target}, direction=${dirName(forward)}, length=${tunnelLength}, starting Y=${bot.entity.position.y.toFixed(0)}`,
     );
 
-    // --- Phase 1: Descend to the resource-appropriate level. Iron/general
-    // use Y=16; coal uses Y=48 where it is materially more common. ---
+    // --- Phase 1: Stone, iron, and coal use Y=48; general mining uses Y=16. ---
     // The old manual staircase dug blocks but moveToPosition often failed to
     // follow it down, so the bot stayed at the surface (Y~64-90) and tunneled
     // where iron is rare — 12 runs found only coal, 0 iron. Use the pathfinder

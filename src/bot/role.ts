@@ -242,10 +242,10 @@ export const SOLO_CONFIG: BotRoleConfig = {
   memoryFile: "memory-solo.json",
   role: "Solo Survivor",
   personality: `You are Solo, an independent Minecraft survivor responsible for taking a fresh world from its first log to a successful Nether expedition. You build practical homes, keep useful supplies organized, and finish the current verified progression objective before chasing side projects.`,
-  leashRadius: 500,
-  homePos: SETTLEMENT_ANCHOR,
-  stashPos: STASH_POS,
-  safeSpawn: { x: STASH_POS.x, y: 0, z: STASH_POS.z },
+  // User-selected settlement center for the current solo world.
+  homePos: { x: -29, y: 120, z: -16 },
+  stashPos: { x: -29, y: 120, z: -16 },
+  leashRadius: 0,
   allowedActions: [
     "explore",
     "go_to",

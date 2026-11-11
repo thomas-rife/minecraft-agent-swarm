@@ -34,10 +34,17 @@ test("configured farm remains inside Flora's leash from the shared base", () => 
   assert.ok(distance <= FLORA_CONFIG.leashRadius);
 });
 
-test("every bot safely spawns at the shared surface base", () => {
-  for (const role of BOT_ROSTER) {
+test("team roles retain their configured shared surface base", () => {
+  for (const role of BOT_ROSTER.filter((role) => role !== SOLO_CONFIG)) {
     assert.equal(role.safeSpawn?.x, STASH_POS.x);
     assert.equal(role.safeSpawn?.z, STASH_POS.z);
     assert.deepEqual(role.homePos, SETTLEMENT_ANCHOR);
   }
+});
+
+test("Solo uses the selected settlement without a spawn override or movement constraints", () => {
+  assert.deepEqual(SOLO_CONFIG.homePos, { x: -29, y: 120, z: -16 });
+  assert.deepEqual(SOLO_CONFIG.stashPos, SOLO_CONFIG.homePos);
+  assert.equal(SOLO_CONFIG.safeSpawn, undefined);
+  assert.equal(SOLO_CONFIG.leashRadius, 0);
 });

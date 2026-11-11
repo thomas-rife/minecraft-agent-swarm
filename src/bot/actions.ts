@@ -12,7 +12,6 @@ import { LOG_TYPES } from "../skills/materials.js";
 import { depositStash, withdrawStash } from "../skills/stash.js";
 import { config } from "../config.js";
 
-import { STASH_POS } from "./role.js";
 import {
   safeMoves,
   explorerMoves,
@@ -73,7 +72,7 @@ async function executeActionInner(bot: Bot, action: string, params: Record<strin
   try {
     switch (action) {
       case "gather_wood":
-        return await gatherWood(bot, params.count || 5);
+        return await gatherWood(bot, params.count || 5, params.settlementAnchor);
       case "mine_block":
         return await mineBlock(bot, params.blockType || "stone", params.protectPos);
       case "go_to":
@@ -421,24 +420,22 @@ async function fellPlannedTree(
   return { chopped: initialCount - remaining, remaining };
 }
 
-async function gatherWood(bot: Bot, count: number): Promise<string> {
+async function gatherWood(
+  bot: Bot,
+  count: number,
+  settlementAnchor?: { x: number; y: number; z: number },
+): Promise<string> {
   // Use shared LOG_TYPES so pale_oak_log (MC 1.21.4) and future wood types are included
   const logTypes = LOG_TYPES as readonly string[];
 
-  // LEASH: wood is gathered near base, period. The explore loop walked bots
-  // ~780 blocks out (Z=-1098 vs base Z=-314) into steep leafy mountains where
-  // EVERY approach failed — 1,000+ "Couldn't reach any trees" per log window,
-  // zero logs banked for 2+ days, while replanted saplings regrow at home.
-  // If the bot has wandered past the leash, spreadplayers it back to base
-  // (safe topmost-block landing, same mechanism brain.ts uses for water
-  // escape) and search from there instead of burning the travel budget in
-  // badlands. Gated on allowInterventions like every other teleport.
-  const leashDist = Math.hypot(bot.entity.position.x - STASH_POS.x, bot.entity.position.z - STASH_POS.z);
+  // Only return to a base explicitly supplied by this bot's role.
+  const rescueCenter = settlementAnchor ?? bot.entity.position;
+  const leashDist = settlementAnchor
+    ? Math.hypot(bot.entity.position.x - settlementAnchor.x, bot.entity.position.z - settlementAnchor.z)
+    : 0;
   if (leashDist > WOOD_LEASH_RADIUS && config.bot.allowInterventions) {
-    console.log(
-      `[GatherDebug] leash: ${bot.username} is ${leashDist.toFixed(0)} blocks from base — TPing home to gather`,
-    );
-    bot.chat(`/spreadplayers ${STASH_POS.x} ${STASH_POS.z} 0 24 false ${bot.username}`);
+    console.log(`[GatherDebug] leash: ${bot.username} is ${leashDist.toFixed(0)} blocks from base — TPing home to gather`);
+    bot.chat(`/spreadplayers ${rescueCenter.x} ${rescueCenter.z} 0 24 false ${bot.username}`);
     await new Promise((r) => setTimeout(r, 4000));
   }
 
@@ -454,7 +451,7 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
     );
     if (!escape.escaped && config.bot.allowInterventions) {
       console.log(`[GatherDebug] enclosed-base rescue: ${bot.username} — TPing to safe surface near base`);
-      bot.chat(`/spreadplayers ${STASH_POS.x} ${STASH_POS.z} 0 24 false ${bot.username}`);
+      bot.chat(`/spreadplayers ${rescueCenter.x} ${rescueCenter.z} 0 24 false ${bot.username}`);
       await new Promise((resolve) => setTimeout(resolve, 4000));
       await bot.waitForChunksToLoad().catch(() => {});
     }
@@ -656,9 +653,9 @@ async function gatherWood(bot: Bot, count: number): Promise<string> {
   // with no saplings AND no reachable trees is doubly stuck (182 fails/hour
   // with zero plantings — the seeds have to come from somewhere). The team
   // stash banks saplings from richer times; withdraw a handful first.
-  if (!bot.inventory.items().some((i) => isTreeSeedItem(i.name))) {
+  if (settlementAnchor && !bot.inventory.items().some((i) => isTreeSeedItem(i.name))) {
     try {
-      await withdrawStash(bot, STASH_POS, "sapling", 8);
+      await withdrawStash(bot, settlementAnchor, "sapling", 8);
     } catch {
       /* stash empty or unreachable — scatterSaplings will no-op below */
     }

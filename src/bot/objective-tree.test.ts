@@ -160,7 +160,7 @@ test("a build sub-objective directly invokes its fixed Mineflayer procedure", ()
   assert.equal(decision?.params.skill, "build_farm");
 });
 
-test("crafting station returns to the settlement before placing a carried table", () => {
+test("crafting station places a carried table locally even far from the settlement", () => {
   const state = snapshot({
     inventory: { crafting_table: 1, oak_log: 2, stick: 2 },
     teamInventory: { crafting_table: 1, oak_log: 2, stick: 2 },
@@ -170,8 +170,43 @@ test("crafting station returns to the settlement before placing a carried table"
   const active = commitment("first_shelter", "progression:crafting_station");
   const view = buildProgressionView(state, { completedObjectives: ["wood_supply"] }, active);
   const decision = getAutomaticSubobjectiveDecision(view, baseOptions);
-  assert.equal(decision?.action, "go_to");
-  assert.deepEqual(decision?.params, { x: 132, y: 70, z: 179 });
+  assert.equal(decision?.action, "place_block");
+  assert.deepEqual(decision?.params, { blockType: "crafting_table" });
+});
+
+test("death recovery rebuilds mining prerequisites without replaying the completed shelter", () => {
+  const active = commitment("stone_survival", "progression:stone_pickaxe");
+  const completedObjectives = ["wood_supply", "crafting_station", "wooden_pickaxe", "starter_shelter"];
+  const next = (inventory: Record<string, number>, visibleTrees = true) =>
+    getAutomaticSubobjectiveDecision(
+      buildProgressionView(
+        snapshot({ inventory, visibleTrees, structures: { ...snapshot().structures, house: "complete" } }),
+        { completedObjectives },
+        active,
+      ),
+      baseOptions,
+    );
+
+  assert.equal(next({}, false)?.action, "explore");
+  assert.equal(next({})?.action, "gather_wood");
+  assert.equal(next({ oak_planks: 8 })?.params.item, "stick");
+  assert.equal(next({ oak_planks: 8, stick: 4 })?.params.item, "crafting_table");
+  assert.equal(next({ oak_planks: 8, stick: 4, crafting_table: 1 })?.params.item, "wooden_pickaxe");
+  assert.equal(next({ wooden_pickaxe: 1 })?.params.skill, "strip_mine");
+  assert.equal(
+    next({ wooden_pickaxe: 1, cobblestone: 3, oak_planks: 4, stick: 2, crafting_table: 1 })?.params.item,
+    "stone_pickaxe",
+  );
+});
+
+test("mining fuel after inventory loss rebuilds a pickaxe before invoking a mining skill", () => {
+  const view = buildProgressionView(
+    snapshot(),
+    { completedObjectives: ["wood_supply", "crafting_station", "wooden_pickaxe", "starter_shelter"] },
+    commitment("stone_survival", "progression:fuel_supply"),
+  );
+  const decision = getAutomaticSubobjectiveDecision(view, baseOptions);
+  assert.equal(decision?.action, "gather_wood");
 });
 
 test("arbitrary nearby water does not unlock farm construction", () => {
