@@ -55,6 +55,10 @@ farm milestones require positive output recorded by the existing skills in
 addition to current world observations. Storage requires observed capacity
 and successful inventory-changing deposit and retrieval actions.
 
+Crafting tables count wherever a bot observes them nearby, including remote
+work sites. Crafting-station verification does not require returning to the
+settlement.
+
 The existing house example still builds a fixed 9×9 lodge, which satisfies
 the starter minimum and can also satisfy the later house size requirement
 once lighting and storage are present. Custom house designs and LLM skill

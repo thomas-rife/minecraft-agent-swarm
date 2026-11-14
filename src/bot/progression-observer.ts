@@ -22,12 +22,12 @@ export function observeProgression(bot: Bot, anchor: { x: number; y: number; z: 
   const structures = getAllMemoryStores()
     .flatMap((store) => [...store.getStructures()])
     .filter(nearBase);
-  const find = (name: string) =>
+  const find = (name: string, settlementOnly = true) =>
     bots.some(
       (member) =>
         !!member.findBlock({
           matching: (block) => block?.name === name,
-          useExtraInfo: (block) => !!block?.position && nearBase(block.position),
+          useExtraInfo: (block) => !!block?.position && (!settlementOnly || nearBase(block.position)),
           maxDistance: 48,
         }),
     );
@@ -86,7 +86,7 @@ export function observeProgression(bot: Bot, anchor: { x: number; y: number; z: 
     );
   return {
     logs: count((name) => name.endsWith("_log")),
-    craftingStation: find("crafting_table"),
+    craftingStation: find("crafting_table", false),
     pickaxeRank: Math.max(0, ...items.filter((item) => item.name.endsWith("_pickaxe")).map((item) => rank(item.name))),
     shelter: !!verifiedHouse && !!clearInterior,
     expandedHouse:

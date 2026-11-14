@@ -1363,7 +1363,7 @@ function leafOptions(view: ObjectiveTreeView, baseOptions: readonly ActionOption
       case "wood_supply":
         return compact([gatherWood(snapshot, 64, "Gather sixteen logs for the first shelter stage.")]);
       case "crafting_station": {
-        const preparation = ensurePortableCrafting(snapshot, 8, "Prepare a crafting station near the base.");
+        const preparation = ensurePortableCrafting(snapshot, 8, "Prepare a crafting station at the current work site.");
         if (preparation) return preparation;
         return [
           {

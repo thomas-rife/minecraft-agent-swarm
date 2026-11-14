@@ -32,7 +32,7 @@ export const PROGRESSION_TREE: readonly ProgressionStage[] = [
       {
         id: "crafting_station",
         goal: "Establish a crafting station",
-        acceptance: "Place a reachable crafting table near the settlement.",
+        acceptance: "Place a reachable crafting table anywhere in the world, including away from the settlement.",
         examples: ["craftCraftingTable"],
       },
       {
