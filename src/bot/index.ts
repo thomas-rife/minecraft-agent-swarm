@@ -7,7 +7,7 @@ import { loader as autoEat } from "mineflayer-auto-eat";
 import { config } from "../config.js";
 import { registerBot as registerViewerBot, isUnifiedViewerStarted } from "../stream/unified-viewer.js";
 import { startViewer } from "../stream/viewer.js";
-import { addChatMessage, setCurrentBot } from "../stream/overlay.js";
+import { addChatMessage } from "../stream/overlay.js";
 import { abortActiveSkill } from "../skills/executor.js";
 import { registerBotMemory, unregisterBotMemory } from "./memory-registry.js";
 import { skillRegistry } from "../skills/registry.js";

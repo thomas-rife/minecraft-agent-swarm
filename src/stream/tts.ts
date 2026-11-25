@@ -12,7 +12,6 @@ if (!fs.existsSync(AUDIO_DIR)) {
 }
 
 let ttsInstance: MsEdgeTTS | null = null;
-let ttsReady = false;
 
 // Voice options — pick one that sounds good for a chaotic game character
 // en-US-GuyNeural is a male voice with good range
@@ -23,7 +22,6 @@ async function getTTS(): Promise<MsEdgeTTS> {
   if (!ttsInstance) {
     ttsInstance = new MsEdgeTTS();
     await ttsInstance.setMetadata(VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    ttsReady = true;
   }
   return ttsInstance;
 }
@@ -77,7 +75,6 @@ export async function generateSpeech(text: string): Promise<string | null> {
     console.error("[TTS] Error generating speech:", err);
     // Reset TTS instance on error so it can reconnect
     ttsInstance = null;
-    ttsReady = false;
     return null;
   }
 }

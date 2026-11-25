@@ -93,7 +93,7 @@ function patchBundle(bundlePath: string): string {
 
   if (match) {
     const socketVar = match[1]; // 'o' in the current bundle
-    const versionVar = match[2]; // 't'
+    const _versionVar = match[2]; // 't'
     const viewerVar = match[3]; // 'u'
 
     // Find the full version handler from the match to the end of the IIFE

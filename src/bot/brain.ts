@@ -27,7 +27,7 @@ import { executeAction } from "./actions.js";
 import { digOutIfStuck, escapeWaterIfDrowning } from "./navigation.js";
 import { updateOverlay, addChatMessage, setCurrentBot } from "../stream/overlay.js";
 import { filterContent, filterChatMessage, filterViewerMessage } from "../safety/filter.js";
-import { abortActiveSkill, isSkillRunning, getActiveSkillName } from "../skills/executor.js";
+import { isSkillRunning, getActiveSkillName } from "../skills/executor.js";
 import { skillRegistry } from "../skills/registry.js";
 import { BotMemoryStore } from "./memory.js";
 import { getAllMemoryStores } from "./memory-registry.js";
@@ -1311,7 +1311,7 @@ export class BotBrain {
 
   private async handleReactive(event: BrainEvent): Promise<void> {
     this.lastReactiveMs = Date.now();
-    const { reason, entities, health, food } = event.data ?? {};
+    const { reason, entities } = event.data ?? {};
 
     // Build a tiny situation description
     let situation: string;
@@ -1372,7 +1372,7 @@ export class BotBrain {
     addChatMessage(this.roleConfig.name, safeResponse, "bot");
   }
 
-  private async handleStrategic(event: BrainEvent): Promise<void> {
+  private async handleStrategic(_event: BrainEvent): Promise<void> {
     const now = Date.now();
     if (now - this.lastStrategicMs < this.STRATEGIC_COOLDOWN_MS) return;
     this.lastStrategicMs = now;

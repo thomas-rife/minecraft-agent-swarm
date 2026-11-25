@@ -30,7 +30,7 @@ export function normalizeShelterDesign(value: unknown): ShelterDesign {
     const parsed = Number(candidate[key]);
     return Number.isFinite(parsed) ? Math.max(min, Math.min(max, Math.round(parsed))) : fallback;
   };
-  const rawName = typeof candidate.name === "string" ? candidate.name.replace(/[^a-z0-9 '\-]/gi, "").trim() : "";
+  const rawName = typeof candidate.name === "string" ? candidate.name.replace(/[^a-z0-9 '-]/gi, "").trim() : "";
   const side = SIDES.has(candidate.doorSide as ShelterDesign["doorSide"])
     ? (candidate.doorSide as ShelterDesign["doorSide"])
     : FALLBACK_SHELTER_DESIGN.doorSide;

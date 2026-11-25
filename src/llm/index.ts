@@ -142,7 +142,7 @@ const ACTION_ALIASES: Record<string, string> = {
 /** Parse and normalize a raw LLM JSON response into a decision. */
 function parseDecision(
   raw: string,
-  botName: string,
+  _botName: string,
 ): {
   thought: string;
   action: string;

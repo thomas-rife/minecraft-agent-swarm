@@ -229,7 +229,7 @@ test("getWorldContext: low elevation with open sky is not classified as undergro
 
 test("getWorldContext: alerts when bot is in water", () => {
   const bot = mockBot({
-    blockAt: (pos: any) => ({ name: "water" }),
+    blockAt: (_pos: any) => ({ name: "water" }),
   });
   const ctx = getWorldContext(bot);
   assert.ok(ctx.includes("ALERT: Bot is IN WATER"));

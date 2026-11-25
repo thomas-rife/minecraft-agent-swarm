@@ -184,7 +184,7 @@ export async function gatherMaterials(
   }
 
   // --- Phase 1: Mine raw materials ---
-  for (const [item, count] of Object.entries(needed)) {
+  for (const item of Object.keys(needed)) {
     if (signal.aborted) return { success: false, message: "Gathering interrupted." };
 
     const mineTargets = MINE_SOURCES[item];

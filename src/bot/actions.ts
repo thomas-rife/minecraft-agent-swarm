@@ -955,7 +955,7 @@ async function goTo(bot: Bot, x: number, y: number, z: number): Promise<string> 
   bot.pathfinder.setMovements(safeMoves(bot));
   try {
     await safeGoto(bot, new goals.GoalNear(cx, cy, cz, 2));
-  } catch (err) {
+  } catch {
     // Rescue mode: safe movements can't dig or tower, so a bot standing in a
     // pit (or behind one block of dirt) is permanently stuck. Retry once with
     // digging + 1x1 towers enabled before giving up.
@@ -1639,7 +1639,7 @@ async function buildShelter(bot: Bot): Promise<string> {
  * Beds need 2 adjacent air blocks on top of 2 solid blocks.
  * Leaves/transparent blocks above are fine — MC allows beds under trees.
  */
-function findFlatSpot(bot: Bot): Vec3 | null {
+function _findFlatSpot(bot: Bot): Vec3 | null {
   const pos = bot.entity.position.floored();
   const directions = [new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)];
 

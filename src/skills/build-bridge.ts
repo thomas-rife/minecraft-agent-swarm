@@ -1,4 +1,3 @@
-import type { Bot } from "mineflayer";
 import type { Skill, SkillResult } from "./types.js";
 import { Vec3 } from "vec3";
 

@@ -49,30 +49,6 @@ const BLOCKED_PATTERNS: RegExp[] = [
   /\bhack\s*(their|his|her)\b/i,
 ];
 
-// Words that are fine in Minecraft context but would be flagged elsewhere
-const MINECRAFT_EXCEPTIONS = new Set([
-  "kill",
-  "killed",
-  "killing",
-  "slay",
-  "slain", // normal combat
-  "die",
-  "died",
-  "death", // normal gameplay
-  "attack",
-  "fight",
-  "destroy", // combat actions
-  "explode",
-  "explosion",
-  "blow up", // creepers
-  "mine",
-  "mining", // core mechanic
-  "shoot",
-  "arrow", // skeletons/bows
-  "spawn",
-  "spawner", // mob spawning
-]);
-
 export interface FilterResult {
   safe: boolean;
   cleaned: string;
